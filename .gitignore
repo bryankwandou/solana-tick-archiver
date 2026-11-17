@@ -1,2 +1,4 @@
 node_modules/
 *.json.gz
+registry.json
+candles-*.json.gz
