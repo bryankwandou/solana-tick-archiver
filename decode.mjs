@@ -143,3 +143,47 @@ export function decodeCandles(z) {
   return rows;
 }
 function bs58dec(s) { let n = 0n; for (const c of s) n = n * 58n + BigInt(B58.indexOf(c)); const out = Buffer.alloc(32); for (let i = 31; i >= 0 && n > 0n; i--) { out[i] = Number(n & 255n); n >>= 8n; } return out; }
+
+// ---------- v2 compact format (local backup) ----------
+// Mint ids come from an append-only dictionary file (one base58 mint per line, id = line index),
+// so chunks never repeat 32-byte addresses. Prices: log-price ticks of 0.01%, delta-coded per mint;
+// volume: log1p quantized to 1%. Decoded prices are within ±0.005% of the original.
+export class MintDict {
+  constructor(file) { this.file = file; this.ids = new Map(); this.list = [];
+    try { for (const m of fs.readFileSync(file, 'utf8').split('\n')) if (m) { this.ids.set(m, this.list.length); this.list.push(m); } } catch {} }
+  id(m) { let i = this.ids.get(m); if (i === undefined) { i = this.list.length; this.ids.set(m, i); this.list.push(m); fs.appendFileSync(this.file, m + '\n'); } return i; }
+}
+export function encodeCandlesV2(rows, dict) {
+  for (const r of rows) r.id = dict.id(r.mint);
+  rows.sort((a, b) => a.id - b.id || a.minute - b.minute);
+  const out = []; const vu = (x) => { while (x >= 128) { out.push((x % 128) | 128); x = Math.floor(x / 128); } out.push(x); };
+  const vs = (x) => vu(x >= 0 ? x * 2 : -x * 2 - 1);
+  const q = (p) => Math.round(Math.log(p) * 10000), qv = (v) => Math.max(0, Math.round(Math.log1p(v) * 100));
+  vu(rows.length); let pid = -1, pt = 0, pc = 0;
+  for (const r of rows) {
+    const first = r.id !== pid;
+    vu(first ? r.id - pid : 0); // 0 = same mint as previous row; else positive id delta (rows sorted by id)
+    if (first) { vu(r.minute); pc = 0; } else vu(r.minute - pt);
+    const O = q(r.o), H = q(r.h), L = q(r.l), C = q(r.c); const flat = O === H && H === L && L === C;
+    vu((flat ? 1 : 0) | (Math.min(r.n, 63) << 1)); if (r.n >= 63) vu(r.n);
+    vs(O - pc); if (!flat) { vu(H - Math.max(O, C)); vu(Math.min(O, C) - L); vs(C - O); }
+    vu(qv(r.v)); pid = r.id; pt = r.minute; pc = C;
+  }
+  return zlib.brotliCompressSync(Buffer.from(out), { params: { [zlib.constants.BROTLI_PARAM_QUALITY]: 11, [zlib.constants.BROTLI_PARAM_LGWIN]: 24 } });
+}
+export function decodeCandlesV2(z, mintList) {
+  const b = zlib.brotliDecompressSync(z); let p = 0;
+  const vu = () => { let x = 0, s = 1; for (;;) { const c = b[p++]; x += (c & 127) * s; if (c < 128) return x; s *= 128; } };
+  const vs = () => { const z = vu(); return z % 2 ? -(z + 1) / 2 : z / 2; };
+  const n = vu(); const rows = []; let id = -1, t = 0, pc = 0;
+  for (let i = 0; i < n; i++) {
+    const d = vu(); if (d) { id += d; t = vu(); pc = 0; } else t += vu();
+    const f = vu(); const flat = f & 1; let cnt = f >> 1; if (cnt >= 63) cnt = vu();
+    const O = pc + vs(); let H = O, L = O, C = O;
+    if (!flat) { const hx = vu(), lx = vu(); C = O + vs(); H = Math.max(O, C) + hx; L = Math.min(O, C) - lx; }
+    const v = Math.expm1(vu() / 100); pc = C;
+    const P = (k) => Math.exp(k / 10000);
+    rows.push({ mint: mintList[id], t, o: P(O), h: P(H), l: P(L), c: P(C), v, n: cnt });
+  }
+  return rows;
+}
