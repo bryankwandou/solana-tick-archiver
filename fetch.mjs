@@ -23,7 +23,11 @@ function connect() {
     log('ws open'); };
   const subName = {};
   ws.onmessage = (ev) => {
-    const m = JSON.parse(ev.data);
+    const s = ev.data;
+    // cheap pre-filter: ~75% of notifications are failed txs or carry no event data
+    if (s.indexOf('"err":null') < 0 && s.indexOf('"result":') > 0 && s.indexOf('"subscription"') > 0) return;
+    if (s.indexOf('"subscription"') > 0 && s.indexOf('Program data: ') < 0) return;
+    const m = JSON.parse(s);
     if (m.id && m.result !== undefined) { subName[m.result] = subs[m.id]; return; }
     if (m.error) { log('rpc error', JSON.stringify(m.error).slice(0, 200)); return; }
     const v = m.params?.result?.value; if (!v || v.err) return;
@@ -40,7 +44,8 @@ const db = await (await DuckDBInstance.create(`md:?motherduck_token=${MD}`)).con
 await db.run(`CREATE DATABASE IF NOT EXISTS solana_ticks`);
 await db.run(`CREATE TABLE IF NOT EXISTS solana_ticks.main.dex_events (ts BIGINT, slot BIGINT, sig VARCHAR, prog VARCHAR, data VARCHAR)`);
 async function sizeGB() {
-  const r = await db.runAndReadAll(`SELECT sum(estimated_size)::DOUBLE b FROM duckdb_tables() WHERE database_name='solana_ticks'`);
+  // real stored bytes (estimated_size in duckdb_tables() is a ROW count, not bytes)
+  const r = await db.runAndReadAll(`SELECT (active_bytes + historical_bytes)::DOUBLE b FROM md_information_schema.storage_info WHERE database_name='solana_ticks'`);
   return Number(r.getRowObjects()[0]?.b || 0) / 1e9;
 }
 let capped = (await sizeGB()) >= CAP_GB;
