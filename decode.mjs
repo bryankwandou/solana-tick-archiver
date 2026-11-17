@@ -93,7 +93,7 @@ export class Registry {
 // ---------- candles ----------
 // Turn a raw trade into { mint, priceUsd, volUsd } using the latest SOL/USD seen in SOL↔USDC/USDT trades.
 export class Candles {
-  constructor(bucketMs = 60000) { this.bucketMs = bucketMs; this.solUsd = 0; this.map = new Map(); this.skipped = 0; }
+  constructor(bucketMs = 60000) { this.bucketMs = bucketMs; this.ticks = []; this.solUsd = 0; this.map = new Map(); this.skipped = 0; }
   add(reg, t, tsMs) {
     const m = reg.mintsOf(t); if (!m) { this.skipped++; return; }
     let [mA, mB] = m, aA = t.amtA, aB = t.amtB; const dA = reg.dec[mA], dB = reg.dec[mB];
@@ -110,11 +110,13 @@ export class Candles {
     if (mA === WSOL && USD.has(mB)) { if (pxQ > 1 && pxQ < 100000) this.solUsd = pxQ; }
     const usdPerQuote = USD.has(mB) ? 1 : this.solUsd; if (!usdPerQuote) { this.skipped++; return; }
     const px = pxQ * usdPerQuote, vol = quote * usdPerQuote; if (!isFinite(px) || px <= 0) return;
+    this.ticks.push({ mint: mA, ts: tsMs, p: px });
     const minute = Math.floor(tsMs / this.bucketMs), key = mA + '|' + minute;
     const c = this.map.get(key);
     if (!c) this.map.set(key, { mint: mA, minute, o: px, h: px, l: px, c: px, v: vol, n: 1 });
     else { if (px > c.h) c.h = px; if (px < c.l) c.l = px; c.c = px; c.v += vol; c.n++; }
   }
+  takeTicks() { const t = this.ticks; this.ticks = []; this.map.clear(); return t; }
   // pop candles whose minute is closed (older than `beforeMinute`)
   take(beforeMinute) { const out = []; for (const [k, c] of this.map) if (c.minute < beforeMinute) { out.push(c); this.map.delete(k); } return out; }
 }
@@ -185,5 +187,30 @@ export function decodeCandlesV2(z, mintList) {
     const P = (k) => Math.exp(k / 10000);
     rows.push({ mint: mintList[id], t, o: P(O), h: P(H), l: P(L), c: P(C), v, n: cnt });
   }
+  return rows;
+}
+
+// ---------- tick format (price only): per chunk rows sorted by mint id, ts ----------
+// id delta, ts delta in ms, log-price delta in 0.01% ticks. ~3-4 bytes per tick after brotli.
+export function encodeTicksV2(rows, dict) {
+  for (const r of rows) r.id = dict.id(r.mint);
+  rows.sort((a, b) => a.id - b.id || a.ts - b.ts);
+  const out = []; const vu = (x) => { while (x >= 128) { out.push((x % 128) | 128); x = Math.floor(x / 128); } out.push(x); };
+  const vs = (x) => vu(x >= 0 ? x * 2 : -x * 2 - 1);
+  vu(rows.length); let pid = -1, pt = 0, pp = 0;
+  for (const r of rows) {
+    const P = Math.round(Math.log(r.p) * 10000);
+    if (r.id !== pid) { vu(r.id - pid); vu(r.ts); vs(P); } else { vu(0); vu(r.ts - pt); vs(P - pp); }
+    pid = r.id; pt = r.ts; pp = P;
+  }
+  return zlib.brotliCompressSync(Buffer.from(out), { params: { [zlib.constants.BROTLI_PARAM_QUALITY]: 11, [zlib.constants.BROTLI_PARAM_LGWIN]: 24 } });
+}
+export function decodeTicksV2(z, mintList) {
+  const b = zlib.brotliDecompressSync(z); let p = 0;
+  const vu = () => { let x = 0, s = 1; for (;;) { const c = b[p++]; x += (c & 127) * s; if (c < 128) return x; s *= 128; } };
+  const vs = () => { const z = vu(); return z % 2 ? -(z + 1) / 2 : z / 2; };
+  const n = vu(); const rows = []; let id = -1, ts = 0, P = 0;
+  for (let i = 0; i < n; i++) { const d = vu(); if (d) { id += d; ts = vu(); P = vs(); } else { ts += vu(); P += vs(); }
+    rows.push({ mint: mintList[id], ts, p: Math.exp(P / 10000) }); }
   return rows;
 }

@@ -49,8 +49,8 @@ function connect() {
 
 const db = await (await DuckDBInstance.create(`md:?motherduck_token=${MD}`)).connect();
 await db.run(`CREATE DATABASE IF NOT EXISTS solana_ticks`);
-await db.run(`CREATE TABLE IF NOT EXISTS solana_ticks.main.dex_events (ts BIGINT, slot BIGINT, sig VARCHAR, prog VARCHAR, data VARCHAR)`);
-await db.run(`CREATE TABLE IF NOT EXISTS solana_ticks.main.candles_1s (mint VARCHAR, t BIGINT, o DOUBLE, h DOUBLE, l DOUBLE, c DOUBLE, v DOUBLE, n INTEGER)`);
+if (RAW) await db.run(`CREATE TABLE IF NOT EXISTS solana_ticks.main.dex_events (ts BIGINT, slot BIGINT, sig VARCHAR, prog VARCHAR, data VARCHAR)`);
+await db.run(`CREATE TABLE IF NOT EXISTS solana_ticks.main.ticks (mint VARCHAR, ts BIGINT, p FLOAT)`);
 // every 15s: resolve pools/mints for new trades and fold them into candles
 setInterval(async () => {
   const tr = pendingTrades; pendingTrades = []; if (!tr.length) return;
@@ -58,13 +58,13 @@ setInterval(async () => {
   for (const [t, ts] of tr) candles.add(reg, t, ts);
   const cut = Date.now() - 120000; for (const [k, v] of seenSig) { if (v < cut) seenSig.delete(k); else break; }
 }, 15000);
-async function flushCandles(all) {
-  const rows = candles.take(all ? Infinity : Math.floor((Date.now() - 30000) / 1000)); /* close buckets 30s late: trades fold in every 15s */ if (!rows.length) return;
-  const f = `candles-${Date.now()}.json.gz`;
-  fs.writeFileSync(f, zlib.gzipSync(rows.map((r) => JSON.stringify({ mint: r.mint, t: r.minute, o: r.o, h: r.h, l: r.l, c: r.c, v: r.v, n: r.n })).join(String.fromCharCode(10))));
-  await db.run(`INSERT INTO solana_ticks.main.candles_1s SELECT mint, t, o, h, l, c, v, n FROM read_json('${f}', format='newline_delimited', columns={mint:'VARCHAR',t:'BIGINT',o:'DOUBLE',h:'DOUBLE',l:'DOUBLE',c:'DOUBLE',v:'DOUBLE',n:'INTEGER'})`);
+async function flushCandles() { // price ticks only: token, time (ms), USD price — no sender, no signature
+  const rows = candles.takeTicks(); if (!rows.length) return;
+  const f = `ticks-${Date.now()}.csv.gz`;
+  fs.writeFileSync(f, zlib.gzipSync(rows.map((r) => `${r.mint},${r.ts},${r.p}`).join(String.fromCharCode(10))));
+  await db.run(`INSERT INTO solana_ticks.main.ticks SELECT * FROM read_csv('${f}', header=false, columns={'mint':'VARCHAR','ts':'BIGINT','p':'FLOAT'})`);
   fs.unlinkSync(f); nCandles += rows.length;
-  log(`candles +${rows.length} (total ${nCandles}, tokens ${new Set(rows.map((r) => r.mint)).size}, SOL/USD ${candles.solUsd.toFixed(2)}, skipped ${candles.skipped})`);
+  log(`ticks +${rows.length} (total ${nCandles}, tokens ${new Set(rows.map((r) => r.mint)).size}, SOL/USD ${candles.solUsd.toFixed(2)}, skipped ${candles.skipped})`);
 }
 async function sizeGB() {
   // real stored bytes (estimated_size in duckdb_tables() is a ROW count, not bytes)
@@ -73,7 +73,7 @@ async function sizeGB() {
 }
 let capped = (await sizeGB()) >= CAP_GB;
 async function flush() {
-  await flushCandles(false).catch((e) => log('candle flush error', e.message));
+  await flushCandles().catch((e) => log('candle flush error', e.message));
   const rows = buf; buf = [];
   if (!rows.length || capped) return;
   const f = `batch-${Date.now()}.json.gz`;
@@ -86,4 +86,4 @@ async function flush() {
 }
 const ws = connect();
 const timer = setInterval(() => flush().catch((e) => log('flush error', e.message)), FLUSH_SEC * 1000);
-setTimeout(async () => { stopped = true; clearInterval(timer); ws.close(); await flush().catch((e) => log('final flush error', e.message)); await flushCandles(true).catch(() => {}); log('done'); process.exit(0); }, RUN_MIN * 60000);
+setTimeout(async () => { stopped = true; clearInterval(timer); ws.close(); await flush().catch((e) => log('final flush error', e.message)); await flushCandles().catch(() => {}); log('done'); process.exit(0); }, RUN_MIN * 60000);

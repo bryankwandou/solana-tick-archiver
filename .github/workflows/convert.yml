@@ -1,0 +1,15 @@
+name: convert-raw-to-ticks
+on: workflow_dispatch
+jobs:
+  convert:
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 22 }
+      - run: npm install --no-audit --no-fund
+      - run: node convert.mjs
+        env:
+          APERTURE_KEY: ${{ secrets.APERTURE_KEY }}
+          MOTHERDUCK_TOKEN: ${{ secrets.MOTHERDUCK_TOKEN }}

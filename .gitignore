@@ -2,3 +2,5 @@ node_modules/
 *.json.gz
 registry.json
 candles-*.json.gz
+conv-*.csv.gz
+ticks-*.csv.gz
