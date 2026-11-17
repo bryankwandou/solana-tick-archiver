@@ -1,0 +1,1 @@
+{"name":"solana-tick-archiver","private":true,"type":"module","dependencies":{"@duckdb/node-api":"1.4.1-r.4"}}
