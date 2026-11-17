@@ -7,6 +7,7 @@ import { decodeEvent, Registry, Candles } from './decode.mjs';
 const KEY = process.env.APERTURE_KEY, MD = process.env.MOTHERDUCK_TOKEN;
 const RUN_MIN = Number(process.env.RUN_MIN || 340), FLUSH_SEC = Number(process.env.FLUSH_SEC || 300);
 const CAP_GB = Number(process.env.CAP_GB || 9);
+const RAW = process.env.RAW === '1'; // raw events ~7 GB/day; off: only 1s candles are stored
 const PROGRAMS = {
   pumpfun: '6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P', pumpswap: 'pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA',
   raydium_amm: '675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8', raydium_clmm: 'CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK',
@@ -16,7 +17,7 @@ const PROGRAMS = {
 let buf = [], total = 0, stopped = false;
 // per-token 1-minute USD candles decoded from swap events (tiny: ~5 MB/day for all tokens)
 const reg = new Registry('registry.json', `https://solana-rpc.rpcfast.com/?api_key=${KEY}`);
-const candles = new Candles(); let pendingTrades = [], seenSig = new Map(), nCandles = 0;
+const candles = new Candles(1000); /* 1-second buckets; 1m/5m/1h derive from these */ let pendingTrades = [], seenSig = new Map(), nCandles = 0;
 const t0 = Date.now(), log = (...a) => console.log(new Date().toISOString().slice(11, 19), ...a);
 
 function connect() {
@@ -39,7 +40,7 @@ function connect() {
     if (!data.length) return;
     if (!seenSig.has(v.signature)) { seenSig.set(v.signature, Date.now());
       for (const d of data) { const t = decodeEvent(Buffer.from(d, 'base64')); if (t) pendingTrades.push([t, Date.now()]); } }
-    buf.push({ ts: Date.now(), slot: m.params.result.context.slot, sig: v.signature, prog: subName[m.params.subscription] || '?', data: data.join(' ') });
+    if (RAW) buf.push({ ts: Date.now(), slot: m.params.result.context.slot, sig: v.signature, prog: subName[m.params.subscription] || '?', data: data.join(' ') });
   };
   ws.onclose = () => { if (!stopped) { log('ws closed, reconnect in 2s'); setTimeout(connect, 2000); } };
   ws.onerror = (e) => log('ws error', e.message || '');
@@ -49,7 +50,7 @@ function connect() {
 const db = await (await DuckDBInstance.create(`md:?motherduck_token=${MD}`)).connect();
 await db.run(`CREATE DATABASE IF NOT EXISTS solana_ticks`);
 await db.run(`CREATE TABLE IF NOT EXISTS solana_ticks.main.dex_events (ts BIGINT, slot BIGINT, sig VARCHAR, prog VARCHAR, data VARCHAR)`);
-await db.run(`CREATE TABLE IF NOT EXISTS solana_ticks.main.candles_1m (mint VARCHAR, t BIGINT, o DOUBLE, h DOUBLE, l DOUBLE, c DOUBLE, v DOUBLE, n INTEGER)`);
+await db.run(`CREATE TABLE IF NOT EXISTS solana_ticks.main.candles_1s (mint VARCHAR, t BIGINT, o DOUBLE, h DOUBLE, l DOUBLE, c DOUBLE, v DOUBLE, n INTEGER)`);
 // every 15s: resolve pools/mints for new trades and fold them into candles
 setInterval(async () => {
   const tr = pendingTrades; pendingTrades = []; if (!tr.length) return;
@@ -58,10 +59,10 @@ setInterval(async () => {
   const cut = Date.now() - 120000; for (const [k, v] of seenSig) { if (v < cut) seenSig.delete(k); else break; }
 }, 15000);
 async function flushCandles(all) {
-  const rows = candles.take(all ? Infinity : Math.floor(Date.now() / 60000) - 1); if (!rows.length) return;
+  const rows = candles.take(all ? Infinity : Math.floor((Date.now() - 30000) / 1000)); /* close buckets 30s late: trades fold in every 15s */ if (!rows.length) return;
   const f = `candles-${Date.now()}.json.gz`;
-  fs.writeFileSync(f, zlib.gzipSync(rows.map((r) => JSON.stringify({ mint: r.mint, t: r.minute * 60, o: r.o, h: r.h, l: r.l, c: r.c, v: r.v, n: r.n })).join(String.fromCharCode(10))));
-  await db.run(`INSERT INTO solana_ticks.main.candles_1m SELECT mint, t, o, h, l, c, v, n FROM read_json('${f}', format='newline_delimited', columns={mint:'VARCHAR',t:'BIGINT',o:'DOUBLE',h:'DOUBLE',l:'DOUBLE',c:'DOUBLE',v:'DOUBLE',n:'INTEGER'})`);
+  fs.writeFileSync(f, zlib.gzipSync(rows.map((r) => JSON.stringify({ mint: r.mint, t: r.minute, o: r.o, h: r.h, l: r.l, c: r.c, v: r.v, n: r.n })).join(String.fromCharCode(10))));
+  await db.run(`INSERT INTO solana_ticks.main.candles_1s SELECT mint, t, o, h, l, c, v, n FROM read_json('${f}', format='newline_delimited', columns={mint:'VARCHAR',t:'BIGINT',o:'DOUBLE',h:'DOUBLE',l:'DOUBLE',c:'DOUBLE',v:'DOUBLE',n:'INTEGER'})`);
   fs.unlinkSync(f); nCandles += rows.length;
   log(`candles +${rows.length} (total ${nCandles}, tokens ${new Set(rows.map((r) => r.mint)).size}, SOL/USD ${candles.solUsd.toFixed(2)}, skipped ${candles.skipped})`);
 }

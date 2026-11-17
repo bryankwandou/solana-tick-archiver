@@ -93,7 +93,7 @@ export class Registry {
 // ---------- candles ----------
 // Turn a raw trade into { mint, priceUsd, volUsd } using the latest SOL/USD seen in SOL↔USDC/USDT trades.
 export class Candles {
-  constructor() { this.solUsd = 0; this.map = new Map(); this.skipped = 0; }
+  constructor(bucketMs = 60000) { this.bucketMs = bucketMs; this.solUsd = 0; this.map = new Map(); this.skipped = 0; }
   add(reg, t, tsMs) {
     const m = reg.mintsOf(t); if (!m) { this.skipped++; return; }
     let [mA, mB] = m, aA = t.amtA, aB = t.amtB; const dA = reg.dec[mA], dB = reg.dec[mB];
@@ -110,7 +110,7 @@ export class Candles {
     if (mA === WSOL && USD.has(mB)) { if (pxQ > 1 && pxQ < 100000) this.solUsd = pxQ; }
     const usdPerQuote = USD.has(mB) ? 1 : this.solUsd; if (!usdPerQuote) { this.skipped++; return; }
     const px = pxQ * usdPerQuote, vol = quote * usdPerQuote; if (!isFinite(px) || px <= 0) return;
-    const minute = Math.floor(tsMs / 60000), key = mA + '|' + minute;
+    const minute = Math.floor(tsMs / this.bucketMs), key = mA + '|' + minute;
     const c = this.map.get(key);
     if (!c) this.map.set(key, { mint: mA, minute, o: px, h: px, l: px, c: px, v: vol, n: 1 });
     else { if (px > c.h) c.h = px; if (px < c.l) c.l = px; c.c = px; c.v += vol; c.n++; }
