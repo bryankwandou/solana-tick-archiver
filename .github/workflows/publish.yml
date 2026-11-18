@@ -1,0 +1,42 @@
+name: publish-data
+# Every complete UTC hour (>= 3 h old, after the 2-hourly backfill) is exported from
+# MotherDuck into bryankwandou/solana-tick-data as tick-v2 + 1-minute candle files.
+# Catch-up by design: a dropped cron run is covered by the next one, nothing is rewritten.
+on:
+  schedule: [{ cron: '23 * * * *' }]
+  workflow_dispatch:
+concurrency: { group: publish-data, cancel-in-progress: false }
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: bryankwandou/solana-tick-data
+          ssh-key: ${{ secrets.DATA_DEPLOY_KEY }}
+          path: data
+      - uses: actions/setup-node@v4
+        with: { node-version: 22 }
+      - run: npm install --no-audit --no-fund
+      - name: export new hours
+        run: |
+          mkdir -p data/hourly
+          node export-db.mjs
+        env:
+          FROM_TS: '1794855600000'
+          LAG_H: '3'
+          OUT: data/hourly
+          MOTHERDUCK_TOKEN: ${{ secrets.MOTHERDUCK_TOKEN }}
+      - name: commit and push
+        run: |
+          cp decode.mjs data/decode.mjs
+          cd data
+          git config user.name "tick-archiver"
+          git config user.email "tick-archiver@users.noreply.github.com"
+          git add -A
+          if git diff --cached --quiet; then echo "nothing new"; exit 0; fi
+          n=$(git diff --cached --name-only | grep -c '^hourly/ticks-' || true)
+          git commit -q -m "add $n hour(s) of ticks"
+          for i in 1 2 3; do git push -q && break; git pull -q --rebase; done

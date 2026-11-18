@@ -7,12 +7,17 @@ import { encodeTicksV2, encodeCandlesV2, MintDict } from './decode.mjs';
 const env = process.env;
 const OUT = process.env.OUT || "export"; fs.mkdirSync(OUT, { recursive: true });
 const db = await (await DuckDBInstance.create(`md:?motherduck_token=${env.MOTHERDUCK_TOKEN}`)).connect();
-const H = 3600000, now = Date.now(), from = Math.floor((now - Number(process.env.FROM_H || 20) * H) / H) * H;
+const H = 3600000;
+// LAG_H: only export whole hours at least this old (the backfill job refills gaps every 2 h),
+// so a published hour file is final and never rewritten. FROM_TS: absolute start (ms).
+const LAG = Number(env.LAG_H || 0) * H;
+const now = LAG ? Math.floor((Date.now() - LAG) / H) * H : Date.now();
+const from = env.FROM_TS ? Math.floor(Number(env.FROM_TS) / H) * H : Math.floor((now - Number(env.FROM_H || 20) * H) / H) * H;
 const dict = new MintDict(path.join(OUT, 'mints.txt')), cdict = new MintDict(path.join(OUT, 'mints-1m.txt'));
 let tTicks = 0, tBytes = 0, cRows = 0, cBytes = 0; const sum = [];
 for (let h = from; h < now; h += H) {
   const name = new Date(h).toISOString().slice(0, 13).replace(/[-T]/g, '');
-  if (fs.existsSync(path.join(OUT, `ticks-${name}.v2.br`)) && h + H < now - 1800000) { console.log(name, 'exists, skip'); continue; }
+  if (fs.existsSync(path.join(OUT, `ticks-${name}.v2.br`)) && (LAG || h + H < now - 1800000)) { continue; }
   const rows = [];
   for (let s = h; s < h + H; s += 600000) for (let k = 0; ; k++) {
     try { const r = await db.runAndReadAll(`SELECT mint, ts::BIGINT ts, p::DOUBLE p FROM solana_ticks.main.ticks WHERE ts >= ${s} AND ts < ${s + 600000} AND p > 0`);
@@ -31,6 +36,9 @@ for (let h = from; h < now; h += H) {
   sum.push([name, rows.length, z.length, zc.length]);
   console.log(name, 'ticks', rows.length, 'tick file', (z.length / 1e6).toFixed(2), 'MB', '1m candles', crow.length, (zc.length / 1e6).toFixed(2), 'MB');
 }
-const dsz = fs.statSync(path.join(OUT, 'mints.txt')).size;
+const mp = path.join(OUT, 'mints.txt'); const dsz = fs.existsSync(mp) ? fs.statSync(mp).size : 0;
 console.log(JSON.stringify({ from: new Date(from).toISOString(), to: new Date(now).toISOString(), ticks: tTicks, tickMB: +(tBytes / 1e6).toFixed(2), mintsTxtMB: +(dsz / 1e6).toFixed(2), candles1m: cRows, candleMB: +(cBytes / 1e6).toFixed(2), tokens: dict.list.length }));
-fs.writeFileSync(path.join(OUT, 'summary.csv'), 'hour_utc,ticks,tick_bytes,candle1m_bytes\n' + sum.map((x) => x.join(',')).join('\n'));
+// summary.csv accumulates across runs (one row per exported hour)
+const sp = path.join(OUT, 'summary.csv');
+const old = fs.existsSync(sp) ? fs.readFileSync(sp, 'utf8').trim().split('\n').slice(1).filter((l) => l && !sum.some((x) => l.startsWith(x[0] + ','))) : [];
+fs.writeFileSync(sp, 'hour_utc,ticks,tick_bytes,candle1m_bytes\n' + [...old, ...sum.filter((x) => x[1] > 0).map((x) => x.join(','))].sort().join('\n') + '\n');
