@@ -5,6 +5,10 @@ name: publish-data
 on:
   schedule: [{ cron: '23 * * * *' }]
   workflow_dispatch:
+  # GitHub drops cron runs; every finished backfill (2-hourly) and archive link also triggers a publish.
+  workflow_run:
+    workflows: [backfill-ticks, archive]
+    types: [completed]
 concurrency: { group: publish-data, cancel-in-progress: false }
 jobs:
   publish:
