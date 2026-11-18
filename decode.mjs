@@ -1,6 +1,10 @@
 // Swap decoder + 1-minute USD candles per token.
 // Decodes the "Program data:" events of: Pump.fun TradeEvent, PumpSwap Buy/SellEvent,
-// Raydium CLMM SwapEvent, Raydium CPMM SwapEvent, Orca Whirlpool Traded.
+// Raydium CLMM SwapEvent, Raydium CPMM SwapEvent, Orca Whirlpool Traded, Raydium LaunchLab TradeEvent.
+// decodeTx() covers what logs alone cannot (needs a full transaction from getBlock/getTransaction):
+//   Meteora DLMM Swap, DBC EvtSwap, DAMM v2 EvtSwap2 (all emit_cpi inner instructions),
+//   Raydium AMM v4 ray_log (pool = instruction account 1), Meteora DAMM v1 Swap (direction from vault deltas).
+// Not covered: Moonshot (MoonCV…, TradeEvent) and Boop (boop8h…): a handful of trades per day on 2026-11-18.
 // Pool → mints and mint → decimals are looked up once via RPC (getMultipleAccounts)
 // and cached on disk in registry.json.
 import crypto from 'crypto'; import fs from 'fs';
@@ -17,9 +21,17 @@ const u64 = (b, o) => Number(b.readBigUInt64LE(o));
 const TOKEN_PROGS = new Set(['TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA', 'TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb']);
 export const WSOL = 'So11111111111111111111111111111111111111112';
 const USD = new Set(['EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v', 'Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB']);
-const OWNERS = { clmm: 'CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK', orca: 'whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc', pumpswap: 'pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA' };
-// pool layouts: offsets of the two mints inside the pool account
-const POOL_MINTS = { clmm: [73, 105], orca: [101, 181], pumpswap: [43, 75] };
+export const PROG = {
+  dlmm: 'LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo', dbc: 'dbcij3LWUppWqq96dh6gJWwBifmcGfLSB5D4DuSMaqN',
+  damm2: 'cpamdpZCGKUy5JxQXB4dcpGPiikHawvSWAd6mEn1sGG', damm1: 'Eo7WjKq67rjJQSZxS6z3YkapzY3eMj6Xy8X5EQVn5UaB',
+  launchlab: 'LanMV9sAd7wArD4vJFi2qDdfnVhFxYSUg6eADduJ3uj', ammv4: '675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8',
+};
+const OWNERS = { clmm: 'CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK', orca: 'whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc', pumpswap: 'pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA',
+  dlmm: PROG.dlmm, damm2: PROG.damm2, launchlab: PROG.launchlab, ammv4: PROG.ammv4, dbc: PROG.dbc };
+// pool layouts: offsets of the two mints inside the pool account (checked against live pool accounts)
+// dbc: [base_mint, config]; the quote mint is read from the config account (offset 8), see resolve()
+const POOL_MINTS = { clmm: [73, 105], orca: [101, 181], pumpswap: [43, 75], dlmm: [88, 120], damm2: [168, 200], launchlab: [205, 237], ammv4: [400, 432], dbc: [136, 72] };
+const DBC_CONFIG_QUOTE = 8;
 
 // Returns a raw trade { pool?, kind, mintA?, mintB?, amtA, amtB } or null.
 // amtA/amtB are raw token amounts of the two sides (A/B as stored in the pool).
@@ -27,6 +39,11 @@ export function decodeEvent(buf) {
   if (buf.length < 16) return null;
   const d = buf.subarray(0, 8).toString('hex');
   try {
+    if (d === D_TRADE && buf.length === 147) { // raydium launchlab (bonk.fun) TradeEvent: spot price from the curve after the trade
+      const vb = u64(buf, 48), vq = u64(buf, 56), rb = u64(buf, 80), rq = u64(buf, 88);
+      const base = vb - rb, quote = vq + rq; if (!(base > 0 && quote > 0)) return null;
+      return { kind: 'launchlab', pool: pk(buf, 8), amtA: 1, amtB: quote / base };
+    }
     if (d === D_TRADE && buf.length >= 97) { // pump.fun bonding curve: base = mint (6 dec), quote = SOL
       const tok = u64(buf, 48), sol = u64(buf, 40); if (!tok || !sol) return null;
       return { kind: 'pumpfun', mintA: pk(buf, 8), mintB: WSOL, amtA: tok, amtB: sol };
@@ -49,6 +66,79 @@ export function decodeEvent(buf) {
     }
   } catch { return null; }
   return null;
+}
+
+// ---------- full-transaction path (programs whose swap data is not in "Program data:" logs) ----------
+// Meteora DLMM / DBC / DAMM v2 emit their swap events with emit_cpi (a self-CPI whose data is
+// 0xe445a52e51cb9a1d + event), which logsSubscribe never shows. Raydium AMM v4 writes "ray_log"
+// (amounts, no pool) and Meteora DAMM v1 a Swap event without pool or direction; both need the
+// instruction's accounts. So these are decoded from a full transaction (getBlock / getTransaction).
+const EMIT_CPI = 'e445a52e51cb9a1d';
+const D_DLMM_SWAP = ev('Swap'), D_DAMM1_SWAP = D_DLMM_SWAP, D_DBC_SWAP = ev('EvtSwap'), D_DAMM2_SWAP2 = ev('EvtSwap2');
+const B58IDX = Object.fromEntries([...B58].map((c, i) => [c, BigInt(i)]));
+function d58(s) { let n = 0n; for (const c of s) n = n * 58n + B58IDX[c]; const a = []; while (n > 0n) { a.push(Number(n & 255n)); n >>= 8n; }
+  for (const c of s) { if (c === '1') a.push(0); else break; } return Buffer.from(a.reverse()); }
+const Q64 = 2 ** 64;
+const sqrtPx = (b, o) => { const s = Number(b.readBigUInt64LE(o)) + Number(b.readBigUInt64LE(o + 8)) * Q64; const r = s / Q64; return r * r; };
+const INVOKE = /^Program ([1-9A-HJ-NP-Za-km-z]{32,44}) invoke \[/, DONE = /^Program [1-9A-HJ-NP-Za-km-z]{32,44} (success|failed)/;
+export const TX_PROGS = new Set([PROG.dlmm, PROG.dbc, PROG.damm2, PROG.damm1, PROG.ammv4]);
+// tx = { transaction: { message: { accountKeys, instructions } }, meta } as returned by getTransaction / getBlock (encoding json)
+export function decodeTx(tx) {
+  const meta = tx.meta; if (!meta || meta.err) return [];
+  const msg = tx.transaction.message;
+  const keys = [...msg.accountKeys, ...(meta.loadedAddresses?.writable || []), ...(meta.loadedAddresses?.readonly || [])];
+  if (!keys.some((k) => TX_PROGS.has(k))) return [];
+  // instructions in execution order (top level, then its inner instructions)
+  const inner = new Map((meta.innerInstructions || []).map((x) => [x.index, x.instructions]));
+  const flat = [];
+  msg.instructions.forEach((ix, i) => { flat.push({ ix, logs: [] }); for (const x of inner.get(i) || []) flat.push({ ix: x, logs: [] }); });
+  // attach "Program data:" / ray_log lines to the instruction that printed them (invoke lines follow execution order)
+  let k = 0; const stack = [];
+  for (const l of meta.logMessages || []) {
+    const inv = INVOKE.exec(l); if (inv) { const id = inv[1];
+      while (k < flat.length && keys[flat[k].ix.programIdIndex] !== id) k++; stack.push(k < flat.length ? k : -1); k++; }
+    else if (DONE.test(l)) stack.pop();
+    else if (stack.length && stack[stack.length - 1] >= 0 && (l.startsWith('Program data: ') || l.startsWith('Program log: ray_log: '))) flat[stack[stack.length - 1]].logs.push(l);
+  }
+  const bal = new Map(); // account index → { mint, pre, post }
+  for (const b of meta.preTokenBalances || []) bal.set(b.accountIndex, { mint: b.mint, pre: BigInt(b.uiTokenAmount.amount), post: 0n });
+  for (const b of meta.postTokenBalances || []) { const x = bal.get(b.accountIndex) || { mint: b.mint, pre: 0n, post: 0n }; x.post = BigInt(b.uiTokenAmount.amount); bal.set(b.accountIndex, x); }
+  const out = [];
+  for (const { ix, logs } of flat) {
+    const prog = keys[ix.programIdIndex]; if (!TX_PROGS.has(prog)) continue;
+    try {
+      if (prog === PROG.ammv4) { // ray_log SwapBaseIn (3) / SwapBaseOut (4): [type u8, 6×u64, out|in u64]; direction 1 = pc→coin, 2 = coin→pc
+        const rl = logs.find((l) => l.startsWith('Program log: ray_log: ')); if (!rl) continue;
+        const b = Buffer.from(rl.slice(22), 'base64'); if (b.length < 57 || (b[0] !== 3 && b[0] !== 4)) continue;
+        const dir = u64(b, 17); const inAmt = b[0] === 3 ? u64(b, 1) : u64(b, 49), outAmt = b[0] === 3 ? u64(b, 49) : u64(b, 9);
+        if (!inAmt || !outAmt || (dir !== 1 && dir !== 2)) continue;
+        const net = inAmt * 0.9975; // 0.25 % trade fee is taken from the input
+        out.push({ kind: 'ammv4', pool: keys[ix.accounts[1]], amtA: dir === 2 ? net : outAmt, amtB: dir === 2 ? outAmt : net });
+        continue;
+      }
+      if (prog === PROG.damm1) { // Swap { in_amount, out_amount, trade_fee, protocol_fee, host_fee }; direction from the pool's token-vault deltas
+        const sw = logs.map((l) => Buffer.from(l.slice(14), 'base64')).find((b) => b.length === 48 && b.subarray(0, 8).toString('hex') === D_DAMM1_SWAP); if (!sw) continue;
+        const va = bal.get(ix.accounts[5]), vb = bal.get(ix.accounts[6]); if (!va || !vb) continue;
+        const inAmt = u64(sw, 8) - u64(sw, 24), outAmt = u64(sw, 16); if (!(inAmt > 0 && outAmt > 0)) continue;
+        const aIn = va.post > va.pre, bIn = vb.post > vb.pre; if (aIn === bIn) continue;
+        out.push({ kind: 'damm1', mintA: va.mint, mintB: vb.mint, amtA: aIn ? inAmt : outAmt, amtB: aIn ? outAmt : inAmt });
+        continue;
+      }
+      const b = d58(ix.data); if (b.length < 24 || b.subarray(0, 8).toString('hex') !== EMIT_CPI) continue;
+      const e = b.subarray(8), d = e.subarray(0, 8).toString('hex');
+      if (prog === PROG.dlmm && d === D_DLMM_SWAP && e.length === 137) { // lb_pair, from, bins, amount_in(80), amount_out(88), swap_for_y(96), fee(97)
+        const inAmt = u64(e, 80) - u64(e, 97), outAmt = u64(e, 88), xIn = e[96] === 1; if (!(inAmt > 0 && outAmt > 0)) continue;
+        out.push({ kind: 'dlmm', pool: pk(e, 8), amtA: xIn ? inAmt : outAmt, amtB: xIn ? outAmt : inAmt });
+      } else if (prog === PROG.dbc && d === D_DBC_SWAP && e.length === 162) { // pool(8), config(40), ..., next_sqrt_price u128 (106): sqrt(quote/base) Q64.64
+        const px = sqrtPx(e, 106); if (!(px > 0)) continue;
+        out.push({ kind: 'dbc', pool: pk(e, 8), amtA: 1, amtB: px });
+      } else if (prog === PROG.damm2 && d === D_DAMM2_SWAP2 && e.length === 188) { // pool(8), ..., next_sqrt_price u128 (92): sqrt(B/A) Q64.64
+        const px = sqrtPx(e, 92); if (!(px > 0)) continue;
+        out.push({ kind: 'damm2', pool: pk(e, 8), amtA: 1, amtB: px });
+      }
+    } catch { /* malformed: skip */ }
+  }
+  return out;
 }
 
 // ---------- registry (pool → mints, mint → decimals) ----------
@@ -75,8 +165,17 @@ export class Registry {
       const acc = await this.accounts(needPools);
       for (const p of needPools) {
         const a = acc[p]; const kind = trades.find((t) => t.pool === p).kind; const offs = POOL_MINTS[kind];
-        this.pools[p] = a && a.owner === OWNERS[kind] && a.data.length >= offs[1] + 32 ? [pk(a.data, offs[0]), pk(a.data, offs[1])] : null;
+        this.pools[p] = a && a.owner === OWNERS[kind] && a.data.length >= Math.max(...offs) + 32 ? [pk(a.data, offs[0]), pk(a.data, offs[1])] : null;
+        if (kind === 'dbc' && this.pools[p]) this.pools[p] = ['cfg', ...this.pools[p]]; // [marker, base_mint, config] until the config is read
       }
+      this.dirty = true;
+    }
+    // dbc: second hop, config account → quote mint
+    const cfgPools = Object.entries(this.pools).filter(([, v]) => v && v[0] === 'cfg');
+    if (cfgPools.length) {
+      const acc = await this.accounts([...new Set(cfgPools.map(([, v]) => v[2]))]);
+      for (const [p, v] of cfgPools) { const a = acc[v[2]];
+        this.pools[p] = a && a.owner === OWNERS.dbc && a.data.length >= DBC_CONFIG_QUOTE + 32 ? [v[1], pk(a.data, DBC_CONFIG_QUOTE)] : null; }
       this.dirty = true;
     }
     const mints = new Set();
@@ -87,13 +186,13 @@ export class Registry {
       this.dirty = true;
     }
   }
-  mintsOf(t) { if (t.mintA) return [t.mintA, t.mintB]; return this.pools[t.pool] || null; }
+  mintsOf(t) { if (t.mintA) return [t.mintA, t.mintB]; const v = this.pools[t.pool]; return v && v[0] !== 'cfg' ? v : null; }
 }
 
 // ---------- candles ----------
 // Turn a raw trade into { mint, priceUsd, volUsd } using the latest SOL/USD seen in SOL↔USDC/USDT trades.
 export class Candles {
-  constructor(bucketMs = 60000) { this.bucketMs = bucketMs; this.ticks = []; this.solUsd = 0; this.map = new Map(); this.skipped = 0; }
+  constructor(bucketMs = 60000) { this.bucketMs = bucketMs; this.ticks = []; this.solUsd = 0; this.map = new Map(); this.skipped = 0; this.byKind = {}; }
   add(reg, t, tsMs) {
     const m = reg.mintsOf(t); if (!m) { this.skipped++; return; }
     let [mA, mB] = m, aA = t.amtA, aB = t.amtB; const dA = reg.dec[mA], dB = reg.dec[mB];
@@ -110,7 +209,7 @@ export class Candles {
     if (mA === WSOL && USD.has(mB)) { if (pxQ > 1 && pxQ < 100000) this.solUsd = pxQ; }
     const usdPerQuote = USD.has(mB) ? 1 : this.solUsd; if (!usdPerQuote) { this.skipped++; return; }
     const px = pxQ * usdPerQuote, vol = quote * usdPerQuote; if (!isFinite(px) || px <= 0) return;
-    this.ticks.push({ mint: mA, ts: tsMs, p: px });
+    this.ticks.push({ mint: mA, ts: tsMs, p: px, k: t.kind }); this.byKind[t.kind] = (this.byKind[t.kind] || 0) + 1; // k = source, for logs only (not stored)
     const minute = Math.floor(tsMs / this.bucketMs), key = mA + '|' + minute;
     const c = this.map.get(key);
     if (!c) this.map.set(key, { mint: mA, minute, o: px, h: px, l: px, c: px, v: vol, n: 1 });

@@ -2,7 +2,7 @@
 // the live archiver's ticks begin. Job PART of PARTS takes one slice of that slot range.
 import { DuckDBInstance } from '@duckdb/node-api';
 import fs from 'fs'; import zlib from 'zlib';
-import { decodeEvent, Registry, Candles } from './decode.mjs';
+import { decodeEvent, decodeTx, Registry, Candles } from './decode.mjs';
 const KEY = process.env.APERTURE_KEY, MD = process.env.MOTHERDUCK_TOKEN;
 const PART = Number(process.env.PART || 0), PARTS = Number(process.env.PARTS || 1), CONC = Number(process.env.CONC || 24);
 const RPC = `https://solana-rpc.rpcfast.com/?api_key=${KEY}`;
@@ -51,6 +51,7 @@ async function worker() {
       for (const l of tx.meta.logMessages || []) if (l.startsWith('Program data: ')) {
         const t = decodeEvent(Buffer.from(l.slice(14), 'base64')); if (t) pending.push([t, ts, slot * 10000 + i]);
       }
+      for (const t of decodeTx(tx)) pending.push([t, ts, slot * 10000 + i]); // Meteora DLMM/DBC/DAMM, Raydium AMM v4
     });
   }
 }
