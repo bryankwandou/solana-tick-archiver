@@ -4,13 +4,14 @@
 // decodeTx() covers what logs alone cannot (needs a full transaction from getBlock/getTransaction):
 //   Meteora DLMM Swap, DBC EvtSwap, DAMM v2 EvtSwap2 (all emit_cpi inner instructions),
 //   Raydium AMM v4 ray_log (pool = instruction account 1), Meteora DAMM v1 Swap (direction from vault deltas).
-// Not covered: Moonshot (MoonCV…, TradeEvent) and Boop (boop8h…): a handful of trades per day on 2026-11-18.
+// Moonshot TradeEvent (154 bytes) and Boop TokenSoldEvent (128) are decoded from logs too. Boop buys
+// (TokenBoughtEvent) are skipped: no buy tx in the RPC history on 2026-11-18 to check the layout against.
 // Pool → mints and mint → decimals are looked up once via RPC (getMultipleAccounts)
 // and cached on disk in registry.json.
 import crypto from 'crypto'; import fs from 'fs';
 
 const ev = (n) => crypto.createHash('sha256').update('event:' + n).digest().subarray(0, 8).toString('hex');
-const D_TRADE = ev('TradeEvent'), D_BUY = ev('BuyEvent'), D_SELL = ev('SellEvent'), D_SWAP = ev('SwapEvent'), D_TRADED = ev('Traded');
+const D_BOOP_SOLD = ev('TokenSoldEvent'), D_TRADE = ev('TradeEvent'), D_BUY = ev('BuyEvent'), D_SELL = ev('SellEvent'), D_SWAP = ev('SwapEvent'), D_TRADED = ev('Traded');
 
 const B58 = '123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz';
 export function b58(buf) { let n = 0n; for (const x of buf) n = n * 256n + BigInt(x); let s = ''; while (n > 0n) { s = B58[Number(n % 58n)] + s; n /= 58n; }
@@ -25,12 +26,13 @@ export const PROG = {
   dlmm: 'LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo', dbc: 'dbcij3LWUppWqq96dh6gJWwBifmcGfLSB5D4DuSMaqN',
   damm2: 'cpamdpZCGKUy5JxQXB4dcpGPiikHawvSWAd6mEn1sGG', damm1: 'Eo7WjKq67rjJQSZxS6z3YkapzY3eMj6Xy8X5EQVn5UaB',
   launchlab: 'LanMV9sAd7wArD4vJFi2qDdfnVhFxYSUg6eADduJ3uj', ammv4: '675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8',
+  moonshot: 'MoonCVVNZFSYkqNXP6bxHLPL6QQJiMagDL3qcqUQTrG', boop: 'boop8hVGQGqehUK2iVEMEnMrL5RbjywRzHKBmBE7ry4',
 };
 const OWNERS = { clmm: 'CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK', orca: 'whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc', pumpswap: 'pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA',
-  dlmm: PROG.dlmm, damm2: PROG.damm2, launchlab: PROG.launchlab, ammv4: PROG.ammv4, dbc: PROG.dbc };
+  dlmm: PROG.dlmm, damm2: PROG.damm2, launchlab: PROG.launchlab, ammv4: PROG.ammv4, dbc: PROG.dbc, moonshot: PROG.moonshot };
 // pool layouts: offsets of the two mints inside the pool account (checked against live pool accounts)
 // dbc: [base_mint, config]; the quote mint is read from the config account (offset 8), see resolve()
-const POOL_MINTS = { clmm: [73, 105], orca: [101, 181], pumpswap: [43, 75], dlmm: [88, 120], damm2: [168, 200], launchlab: [205, 237], ammv4: [400, 432], dbc: [136, 72] };
+const POOL_MINTS = { clmm: [73, 105], orca: [101, 181], pumpswap: [43, 75], dlmm: [88, 120], damm2: [168, 200], launchlab: [205, 237], ammv4: [400, 432], dbc: [136, 72], moonshot: [24, -1] }; // moonshot: curve.mint, quote = WSOL (-1)
 const DBC_CONFIG_QUOTE = 8;
 
 // Returns a raw trade { pool?, kind, mintA?, mintB?, amtA, amtB } or null.
@@ -43,6 +45,14 @@ export function decodeEvent(buf) {
       const vb = u64(buf, 48), vq = u64(buf, 56), rb = u64(buf, 80), rq = u64(buf, 88);
       const base = vb - rb, quote = vq + rq; if (!(base > 0 && quote > 0)) return null;
       return { kind: 'launchlab', pool: pk(buf, 8), amtA: 1, amtB: quote / base };
+    }
+    if (d === D_TRADE && buf.length === 154) { // moonshot: amount(8) tokens, collateral_amount(16) lamports, curve(48), cost_token(80), type(144)
+      const tok = u64(buf, 8), col = u64(buf, 16); if (!tok || col < 100000 || pk(buf, 80) !== WSOL) return null; // dust trades round the price
+      return { kind: 'moonshot', pool: pk(buf, 48), amtA: tok, amtB: col };
+    }
+    if (d === D_BOOP_SOLD && buf.length === 128) { // boop TokenSoldEvent: mint(8), amount_in(40) tokens, amount_out(48) lamports, swap_fee(56)
+      const tok = u64(buf, 40), sol = u64(buf, 48); if (!tok || sol < 100000) return null;
+      return { kind: 'boop', mintA: pk(buf, 8), mintB: WSOL, amtA: tok, amtB: sol };
     }
     if (d === D_TRADE && buf.length >= 97) { // pump.fun bonding curve: base = mint (6 dec), quote = SOL
       const tok = u64(buf, 48), sol = u64(buf, 40); if (!tok || !sol) return null;
@@ -165,7 +175,7 @@ export class Registry {
       const acc = await this.accounts(needPools);
       for (const p of needPools) {
         const a = acc[p]; const kind = trades.find((t) => t.pool === p).kind; const offs = POOL_MINTS[kind];
-        this.pools[p] = a && a.owner === OWNERS[kind] && a.data.length >= Math.max(...offs) + 32 ? [pk(a.data, offs[0]), pk(a.data, offs[1])] : null;
+        this.pools[p] = a && a.owner === OWNERS[kind] && a.data.length >= Math.max(...offs) + 32 ? [pk(a.data, offs[0]), offs[1] < 0 ? WSOL : pk(a.data, offs[1])] : null;
         if (kind === 'dbc' && this.pools[p]) this.pools[p] = ['cfg', ...this.pools[p]]; // [marker, base_mint, config] until the config is read
       }
       this.dirty = true;

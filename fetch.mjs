@@ -14,6 +14,7 @@ const PROGRAMS = {
   raydium_cpmm: 'CPMMoo8L3F4NbTegBCKVNunggL7H1ZpdTHKxQB5qKP1C', orca_whirlpool: 'whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc',
   meteora_dlmm: 'LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo', jupiter_v6: 'JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4',
   raydium_launchlab: 'LanMV9sAd7wArD4vJFi2qDdfnVhFxYSUg6eADduJ3uj',
+  moonshot: 'MoonCVVNZFSYkqNXP6bxHLPL6QQJiMagDL3qcqUQTrG', boop: 'boop8hVGQGqehUK2iVEMEnMrL5RbjywRzHKBmBE7ry4',
 };
 let buf = [], total = 0, stopped = false;
 // per-token 1-minute USD candles decoded from swap events (tiny: ~5 MB/day for all tokens)
