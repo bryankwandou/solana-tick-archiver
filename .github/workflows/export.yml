@@ -1,0 +1,18 @@
+name: export-ticks
+on: workflow_dispatch
+jobs:
+  export:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 22 }
+      - run: npm install --no-audit --no-fund
+      - run: node export-db.mjs
+        env:
+          FROM_H: 22
+          OUT: export
+          MOTHERDUCK_TOKEN: ${{ secrets.MOTHERDUCK_TOKEN }}
+      - uses: actions/upload-artifact@v4
+        with: { name: ticks-export, path: export, retention-days: 7, compression-level: 0 }
