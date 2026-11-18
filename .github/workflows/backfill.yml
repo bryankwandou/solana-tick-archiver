@@ -1,5 +1,9 @@
 name: backfill-ticks
-on: workflow_dispatch
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "41 */2 * * *"
+concurrency: { group: backfill, cancel-in-progress: false }
 jobs:
   plan:
     runs-on: ubuntu-latest
