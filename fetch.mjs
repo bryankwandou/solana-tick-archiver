@@ -24,7 +24,7 @@ function connect() {
   const ws = new WebSocket(`wss://solana-rpc.rpcfast.com/?api_key=${KEY}`);
   const subs = {};
   ws.onopen = () => { let id = 1; for (const [name, p] of Object.entries(PROGRAMS)) {
-    subs[id] = name; ws.send(JSON.stringify({ jsonrpc: '2.0', id: id++, method: 'logsSubscribe', params: [{ mentions: [p] }, { commitment: 'confirmed' }] })); }
+    subs[id] = name; ws.send(JSON.stringify({ jsonrpc: '2.0', id: id++, method: 'logsSubscribe', params: [{ mentions: [p] }, { commitment: 'processed' }] })); }
     log('ws open'); };
   const subName = {};
   ws.onmessage = (ev) => {

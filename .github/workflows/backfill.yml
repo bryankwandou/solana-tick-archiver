@@ -1,0 +1,22 @@
+name: backfill-ticks
+on: workflow_dispatch
+jobs:
+  backfill:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    strategy:
+      fail-fast: false
+      matrix:
+        part: [0, 1, 2, 3, 4, 5, 6, 7]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 22 }
+      - run: npm install --no-audit --no-fund
+      - run: node backfill.mjs
+        env:
+          PART: ${{ matrix.part }}
+          PARTS: 8
+          CONC: 40
+          APERTURE_KEY: ${{ secrets.APERTURE_KEY }}
+          MOTHERDUCK_TOKEN: ${{ secrets.MOTHERDUCK_TOKEN }}

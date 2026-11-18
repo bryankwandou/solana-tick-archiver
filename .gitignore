@@ -4,3 +4,4 @@ registry.json
 candles-*.json.gz
 conv-*.csv.gz
 ticks-*.csv.gz
+bf-*.csv.gz
