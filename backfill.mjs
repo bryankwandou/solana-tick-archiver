@@ -16,13 +16,13 @@ const rpc = async (method, params, tries = 4) => {
 };
 const db = await (await DuckDBInstance.create(`md:?motherduck_token=${MD}`)).connect();
 await db.run(`CREATE TABLE IF NOT EXISTS solana_ticks.main.ticks (mint VARCHAR, ts BIGINT, p FLOAT)`);
-const liveFirst = Number((await db.runAndReadAll(`SELECT min(ts)::BIGINT t FROM solana_ticks.main.ticks`)).getRowObjects()[0].t);
-// slot range: first available block (+margin, the node keeps pruning) → last slot before liveFirst
-const first = (await rpc('getFirstAvailableBlock', [])) + 3000;
-let lo = first, hi = await rpc('getSlot', [{ commitment: 'finalized' }]);
-while (hi - lo > 50) { const mid = Math.floor((lo + hi) / 2); let t = null; for (let k = 0; k < 20 && t == null; k++) t = await rpc('getBlockTime', [mid + k]); if (t == null || t * 1000 >= liveFirst) hi = mid; else lo = mid; }
-const end = lo, span = end - first, a = first + Math.floor(span * PART / PARTS), b = first + Math.floor(span * (PART + 1) / PARTS);
-log(`range ${first}..${end} (${span} slots), my part ${a}..${b}; live ticks start ${new Date(liveFirst).toISOString()}`);
+// RANGES (from plan.mjs) = gap slot ranges, oldest first. Slots are cut into 50-slot chunks dealt
+// round-robin to the parts, so every part starts at the oldest blocks before the node prunes them.
+const RANGES = JSON.parse(process.env.RANGES || '[]');
+const mine = []; let ci = 0;
+for (const [ra, rb] of RANGES) for (let s = ra; s < rb; s += 50, ci++) if (ci % PARTS === PART) for (let x = s; x < Math.min(s + 50, rb); x++) mine.push(x);
+const a = 0, b = mine.length;
+log(`${RANGES.length} gap ranges, my ${b} slots${b ? ` from ${mine[0]} to ${mine[b - 1]}` : ''}`);
 const reg = new Registry('registry.json', RPC); const C = new Candles(1000);
 let pending = [], total = 0, blocks = 0, bytes = 0; const t0 = Date.now();
 async function flush() {
@@ -41,7 +41,7 @@ async function flush() {
 let next = a;
 async function worker() {
   while (next < b) {
-    const slot = next++;
+    const slot = mine[next++];
     let blk; try { blk = await rpc('getBlock', [slot, { encoding: 'json', transactionDetails: 'full', rewards: false, maxSupportedTransactionVersion: 1 }]); } catch (e) { log('block', slot, e.message); continue; }
     blocks++; if (!blk) continue;
     const ts = (blk.blockTime || 0) * 1000;
