@@ -1,0 +1,77 @@
+name: batch-2h
+# Jenis 2 (CI/CD Hemat): 1 single-runner job every 2 hours (4 worker threads x getBlock)
+# Covers all 14 Solana DEXes -> writes to MotherDuck in 1 batch -> publishes ticks + candles1m to solana-tick-data.
+on:
+  schedule:
+    - cron: "7 */2 * * *"
+  workflow_dispatch:
+    inputs:
+      bench_minutes:
+        description: "0 = production gap sync + publish; >0 (e.g. 120) = side-by-side 2h benchmark vs archive"
+        required: false
+        default: "0"
+      workers:
+        description: "Parallel worker threads"
+        required: false
+        default: "4"
+      conc_per_worker:
+        description: "Concurrent getBlock requests per worker"
+        required: false
+        default: "20"
+
+concurrency:
+  group: batch-2h
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - run: npm install --no-audit --no-fund
+      - name: Restore pool/mint registry cache
+        uses: actions/cache@v4
+        with:
+          path: registry.json
+          key: registry-v1-${{ github.run_id }}
+          restore-keys: |
+            registry-v1-
+      - name: Run 2-hourly full-block batch sync / benchmark
+        env:
+          NODE_OPTIONS: "--max-old-space-size=8192"
+          APERTURE_KEY: ${{ secrets.APERTURE_KEY }}
+          MOTHERDUCK_TOKEN: ${{ secrets.MOTHERDUCK_TOKEN }}
+          BENCH_MINUTES: ${{ inputs.bench_minutes || '0' }}
+          WORKERS: ${{ inputs.workers || '4' }}
+          CONC_PER_WORKER: ${{ inputs.conc_per_worker || '20' }}
+        run: node batch-sync.mjs
+      - name: Checkout solana-tick-data for publish (production mode only)
+        if: ${{ inputs.bench_minutes == '' || inputs.bench_minutes == '0' }}
+        uses: actions/checkout@v4
+        with:
+          repository: bryankwandou/solana-tick-data
+          ssh-key: ${{ secrets.DATA_DEPLOY_KEY }}
+          path: data
+      - name: Export complete hours (ticks + candles1m) and push
+        if: ${{ inputs.bench_minutes == '' || inputs.bench_minutes == '0' }}
+        env:
+          FROM_TS: "1794855600000"
+          LAG_H: "1"
+          OUT: data/hourly
+          MOTHERDUCK_TOKEN: ${{ secrets.MOTHERDUCK_TOKEN }}
+        run: |
+          mkdir -p data/hourly
+          node export-db.mjs
+          cp decode.mjs data/decode.mjs
+          cd data
+          git config user.name "tick-archiver"
+          git config user.email "tick-archiver@users.noreply.github.com"
+          git add -A
+          if git diff --cached --quiet; then echo "nothing new"; exit 0; fi
+          n=$(git diff --cached --name-only | grep -c '^hourly/ticks-' || true)
+          git commit -q -m "batch-2h: add $n hour(s) of ticks + candles1m"
+          for i in 1 2 3; do git push -q && break; git pull -q --rebase; done
