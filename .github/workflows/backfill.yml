@@ -1,8 +1,7 @@
 name: backfill-ticks
+# Manual 8-runner deep-recovery fallback only (2-hourly schedule replaced by single-runner batch-2h.yml).
 on:
   workflow_dispatch:
-  schedule:
-    - cron: "41 */2 * * *"
 concurrency: { group: backfill, cancel-in-progress: false }
 jobs:
   plan:
