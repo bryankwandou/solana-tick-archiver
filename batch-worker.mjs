@@ -1,6 +1,6 @@
 // Worker thread for parallel getBlock fetch + JSON parse + swap decode across vCPUs.
 import { parentPort, workerData } from 'worker_threads';
-import { decodeEvent, decodeTx } from './decode.mjs';
+import { decodeEvent, decodeTx, decodeUniversalTx } from './decode.mjs';
 
 const { workerId, slots, rpcUrl, conc } = workerData;
 
@@ -79,19 +79,27 @@ async function runSlotLoop() {
       // Preserve intra-block chronological order within the ~400ms slot window
       const ts = baseMs + Math.min(999, Math.floor((i * 400) / txTotal));
       const order = slot * 10000 + i;
+      let txHit = 0;
       const logs = tx.meta.logMessages;
       if (logs) {
         for (let li = 0; li < logs.length; li++) {
           const l = logs[li];
           if (l.startsWith('Program data: ')) {
             const t = decodeEvent(Buffer.from(l.slice(14), 'base64'));
-            if (t) batch.push([t, ts, order]);
+            if (t) { batch.push([t, ts, order]); txHit++; }
           }
         }
       }
       const extra = decodeTx(tx);
       for (let ei = 0; ei < extra.length; ei++) {
         batch.push([extra[ei], ts, order]);
+        txHit++;
+      }
+      // Universal fallback: captures SolFi, HumidiFi, ZeroFi, Phoenix, OpenBook, Manifest,
+      // Lifinity, Stabble, Sanctum, Heaven, Boop buys, and ANY other Solana DEX!
+      if (txHit === 0) {
+        const u = decodeUniversalTx(tx);
+        if (u) batch.push([u, ts, order]);
       }
     }
     if (batch.length >= 2000) flushToParent();
@@ -107,3 +115,4 @@ await Promise.all(Array.from({ length: Math.max(1, conc) }, runSlotLoop));
 clearInterval(progressTimer);
 flushToParent();
 parentPort.postMessage({ type: 'done', workerId, doneBlocks, skippedSlots, errorSlots, rpcCalls });
+

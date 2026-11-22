@@ -151,6 +151,155 @@ export function decodeTx(tx) {
   return out;
 }
 
+// ---------- universal all-Solana swap fallback (every other DEX, prop-AMM, CLOB, launchpad) ----------
+// Catches executed fills from SolFi, HumidiFi, ZeroFi, Obric, Tessera, GoonFi, Phoenix, OpenBook v1/v2,
+// Manifest, Lifinity v1/v2, Stabble, Sanctum, Saber, Mercurial, Saros, Fluxbeam, BonkSwap, Heaven,
+// Boop buys, OKX/DFlow/Titan/Jupiter routes, and ANY brand-new DEX via validator-verified balance deltas.
+const CORE_NON_DEX = new Set([
+  '11111111111111111111111111111111',
+  'ComputeBudget111111111111111111111111111111',
+  'TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA',
+  'TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb',
+  'ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL',
+  'MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr',
+  'Memo1UhkJRfHyvLMcVucJwxXeuD728EqVDDwQDxFMNo',
+  'AddressLookupTab1e1111111111111111111111111',
+  'Stake11111111111111111111111111111111111111',
+  'Vote111111111111111111111111111111111111111',
+  'SysvarRent111111111111111111111111111111111',
+  'SysvarC1ock11111111111111111111111111111111',
+  'Sysvar1nstructions1111111111111111111111111',
+]);
+const EXTRA_DEX_TAGS = [
+  ['BiSoNHVpsVZW2F7rx2eQ59yQwKxzU5NvBcmKshCSUypi', 'bisonfi'],
+  ['ALPHAQmeA7bjrVuccPsYPiCvsi428SNwte66Srvs4pHA', 'alphaq'],
+  ['Archer8kgiavM61GyusMzaaS2ft5sALtNsD1HxkUPMhy', 'archer'],
+  ['SoLFiHG9TfgtdUXUjWAxi3LtvYuFyDLVhBWxdMZxyCe', 'solfi'],
+  ['9H6tua7jkLhdm3w8BvgpTn5LZNU7g4ZynDmCiNN3q6Rp', 'humidifi'],
+  ['ZERor4xhbUycZ6gb9ntrhqscUcZmAbQDjEAtCf4hbZY', 'zerofi'],
+  ['obriQD1zbpyLz95G5n7nJe6a4DPjpFwa5XYPoNm113y', 'obric'],
+  ['TessVdML9pBGgG9yGks7o4HewRaXVAMuoVj4x83GLsV', 'tessera'],
+  ['goonERTdGsjnkZqWuVjs73BZ3Pb9qoCUdJR17gh3f6J', 'goonfi'],
+  ['PhoeNiXZ8ByJGLkxNfZRnkUfjvmuYqLR89jjFHGqdXY', 'phoenix'],
+  ['opnb2LAfJYbRMAHHvqjCwQxanZn7ReEHp1k81EohpZb', 'openbook_v2'],
+  ['srmqPvymJeFKQ4zGQed1GFppgkRHL9kaELCbyksJtPX', 'openbook_v1'],
+  ['MNFSTqtC93rEfYHB6hF82sKdZpUDFWkViLByLd1k1Ms', 'manifest'],
+  ['2wT8Yq49kHgDzXuPxZSaeLaH1qbmGXtEyPy64bL7aD3c', 'lifinity_v2'],
+  ['EewxydAPCCVuNEyrVN68PuSYdQ7wKn27V9Gjeoi8dy3S', 'lifinity_v1'],
+  ['swapNyd8XiQwJ6ianp9snpu4brUqFxadzvHebnAXjJZ', 'stabble'],
+  ['5ocnV1qiCgaQR8Jb8xWnVbApfaygJ8tNoZfgPwsgx9kx', 'sanctum'],
+  ['HEAVENoP2qxoeuF8Dj2oT1GHEnu49U5mJYkdeC8BAX2o', 'heaven'],
+  ['SSwpkEEcbUqx4vtoEByFjSkhKdCT862DNVb52nZg1UZ', 'saber'],
+  ['MERLuDFBMmsHnsBPZw2sDQZHvXFMwp8EdjudcU2HKky', 'mercurial'],
+  ['SSwapUtytfBdBn1b9NUGG6foMVPtcWgpRU32HToDUZr', 'saros'],
+  ['FLUXubRmkEi2q6K3Y9kBPg9248ggaZVsoSFhtJHSrm1X', 'fluxbeam'],
+  ['BSwp6bEBihVLdqJRKGgzjcGLHkcTuzmSo1TQkHepzH8p', 'bonkswap'],
+  ['6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P', 'pumpfun_tx'],
+  ['boop8hVGQGqehUK2iVEMEnMrL5RbjywRzHKBmBE7ry4', 'boop_tx'],
+  ['6m2CDdhRgxpH4WjvdzxAYbGxwdGUz5MziiL5jek2kBma', 'okx_dex'],
+  ['DF1ow4tspfHX9JwWJsAb9epbkA8hmpSEAtxXy1V27QBH', 'dflow'],
+  ['T1TANpTeScyeqVzzgNViGDNrkQ6qHz9KrSBS4aNXvGT', 'titan'],
+  ['JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4', 'jupiter_other'],
+];
+
+function extractOwnerSwap(byMint, kind) {
+  let wsol = 0;
+  let usdMint = null, usdDelta = 0, usdDec = 6;
+  const nonQuote = [];
+  for (const [mint, v] of byMint) {
+    if (Math.abs(v.delta) < 1) continue;
+    if (mint === WSOL) { wsol = v.delta; }
+    else if (USD.has(mint)) {
+      if (Math.abs(v.delta) > Math.abs(usdDelta)) { usdMint = mint; usdDelta = v.delta; usdDec = v.dec; }
+    } else {
+      nonQuote.push({ mint, delta: v.delta, dec: v.dec });
+    }
+  }
+  if (nonQuote.length === 1) {
+    const tok = nonQuote[0];
+    if (usdMint && Math.abs(usdDelta) >= 10 ** usdDec && (tok.delta > 0) !== (usdDelta > 0)) {
+      return { kind, mintA: tok.mint, mintB: usdMint, amtA: Math.abs(tok.delta), amtB: Math.abs(usdDelta), decA: tok.dec, decB: usdDec };
+    }
+    if (Math.abs(wsol) >= 10_000_000 && (tok.delta > 0) !== (wsol > 0)) {
+      return { kind, mintA: tok.mint, mintB: WSOL, amtA: Math.abs(tok.delta), amtB: Math.abs(wsol), decA: tok.dec, decB: 9 };
+    }
+    return null;
+  }
+  if (nonQuote.length === 0 && usdMint && Math.abs(wsol) >= 50_000_000 && Math.abs(usdDelta) >= 10 ** usdDec && (wsol > 0) !== (usdDelta > 0)) {
+    return { kind, mintA: WSOL, mintB: usdMint, amtA: Math.abs(wsol), amtB: Math.abs(usdDelta), decA: 9, decB: usdDec };
+  }
+  return null;
+}
+
+export function decodeUniversalTx(tx) {
+  const meta = tx.meta; if (!meta || meta.err) return null;
+  const msg = tx.transaction?.message; if (!msg) return null;
+  const keys = [...msg.accountKeys, ...(meta.loadedAddresses?.writable || []), ...(meta.loadedAddresses?.readonly || [])];
+  if (!keys.length) return null;
+
+  // Require at least one invoked non-core program (eliminates plain SPL/SOL transfers)
+  let hasNonCore = false;
+  for (let i = 0; i < msg.instructions.length; i++) {
+    const pid = keys[msg.instructions[i].programIdIndex];
+    if (pid && !CORE_NON_DEX.has(pid)) { hasNonCore = true; break; }
+  }
+  if (!hasNonCore) return null;
+
+  // Group token balance deltas by owner (supports signer, relayer, smart wallet, and pool vault swaps)
+  const owners = new Map();
+  const addBal = (list, sign) => {
+    for (let i = 0; i < list.length; i++) {
+      const b = list[i];
+      if (!b || !b.owner) continue;
+      const amt = Number(b.uiTokenAmount?.amount || 0);
+      const dec = b.uiTokenAmount?.decimals;
+      if (dec == null) continue;
+      let bm = owners.get(b.owner);
+      if (!bm) owners.set(b.owner, (bm = new Map()));
+      const cur = bm.get(b.mint);
+      if (!cur) bm.set(b.mint, { delta: sign * amt, dec });
+      else cur.delta += sign * amt;
+    }
+  };
+  if (meta.preTokenBalances) addBal(meta.preTokenBalances, -1);
+  if (meta.postTokenBalances) addBal(meta.postTokenBalances, 1);
+
+  // Include signer[0]'s net native SOL delta (excluding network fee; >= 0.01 SOL filters ATA rent)
+  const signer0 = keys[0];
+  const preSol = meta.preBalances?.[0] ?? 0;
+  const postSol = meta.postBalances?.[0] ?? 0;
+  const nativeLamports = (postSol - preSol) + (meta.fee || 0);
+  if (Math.abs(nativeLamports) >= 10_000_000) {
+    let bm = owners.get(signer0);
+    if (!bm) owners.set(signer0, (bm = new Map()));
+    const cur = bm.get(WSOL);
+    if (!cur) bm.set(WSOL, { delta: nativeLamports, dec: 9 });
+    else cur.delta += nativeLamports;
+  }
+
+  if (!owners.size) return null;
+
+  const keySet = new Set(keys);
+  let kind = 'other_dex';
+  for (let i = 0; i < EXTRA_DEX_TAGS.length; i++) {
+    if (keySet.has(EXTRA_DEX_TAGS[i][0])) { kind = EXTRA_DEX_TAGS[i][1]; break; }
+  }
+
+  // 1. Prefer fee-payer / trader signer[0]
+  const bm0 = owners.get(signer0);
+  if (bm0) {
+    const s0 = extractOwnerSwap(bm0, kind);
+    if (s0) return s0;
+  }
+  // 2. Fallback: sub-signer / relayer / AMM vault owner with a clean 2-asset opposite-sign swap
+  for (const [owner, bm] of owners) {
+    if (owner === signer0) continue;
+    const s = extractOwnerSwap(bm, kind);
+    if (s) return s;
+  }
+  return null;
+}
+
 // ---------- registry (pool → mints, mint → decimals) ----------
 export class Registry {
   constructor(file, rpcUrl) { this.file = file; this.rpc = rpcUrl;
@@ -189,7 +338,11 @@ export class Registry {
       this.dirty = true;
     }
     const mints = new Set();
-    for (const t of trades) { const m = this.mintsOf(t); if (m) for (const x of m) if (!(x in this.dec)) mints.add(x); }
+    for (const t of trades) {
+      if (t.mintA && t.decA != null && !(t.mintA in this.dec)) { this.dec[t.mintA] = t.decA; this.dirty = true; }
+      if (t.mintB && t.decB != null && !(t.mintB in this.dec)) { this.dec[t.mintB] = t.decB; this.dirty = true; }
+      const m = this.mintsOf(t); if (m) for (const x of m) if (!(x in this.dec)) mints.add(x);
+    }
     if (mints.size) {
       const acc = await this.accounts([...mints]);
       for (const m of mints) { const a = acc[m]; this.dec[m] = a && TOKEN_PROGS.has(a.owner) && a.data.length >= 45 ? a.data[44] : null; }
@@ -205,15 +358,17 @@ export class Candles {
   constructor(bucketMs = 60000) { this.bucketMs = bucketMs; this.ticks = []; this.solUsd = 0; this.map = new Map(); this.skipped = 0; this.byKind = {}; }
   add(reg, t, tsMs) {
     const m = reg.mintsOf(t); if (!m) { this.skipped++; return; }
-    let [mA, mB] = m, aA = t.amtA, aB = t.amtB; const dA = reg.dec[mA], dB = reg.dec[mB];
+    let [mA, mB] = m, aA = t.amtA, aB = t.amtB;
+    const dA = t.decA ?? reg.dec[mA], dB = t.decB ?? reg.dec[mB];
     if (dA == null || dB == null) { this.skipped++; return; }
+    let dBase = dA, dQuote = dB;
     let qA = mA === WSOL || USD.has(mA), qB = mB === WSOL || USD.has(mB);
     // orient: base = non-quote side; SOL vs USD → base SOL
-    if (qA && !qB) { [mA, mB] = [mB, mA]; [aA, aB] = [aB, aA]; }
-    else if (qA && qB) { if (USD.has(mA)) { [mA, mB] = [mB, mA]; [aA, aB] = [aB, aA]; } if (mA !== WSOL) { this.skipped++; return; } }
+    if (qA && !qB) { [mA, mB] = [mB, mA]; [aA, aB] = [aB, aA]; [dBase, dQuote] = [dQuote, dBase]; }
+    else if (qA && qB) { if (USD.has(mA)) { [mA, mB] = [mB, mA]; [aA, aB] = [aB, aA]; [dBase, dQuote] = [dQuote, dBase]; } if (mA !== WSOL) { this.skipped++; return; } }
     else if (!qB) { this.skipped++; return; } // token↔token with no SOL/USD side
-    if (t.kind === 'pumpfun' && reg.dec[mA] !== 6) { this.skipped++; return; } // pump.fun mints are always 6 decimals; others reuse the event name
-    const base = aA / 10 ** reg.dec[mA], quote = aB / 10 ** reg.dec[mB]; if (!(base > 0 && quote > 0)) return;
+    if (t.kind === 'pumpfun' && dBase !== 6) { this.skipped++; return; } // pump.fun mints are always 6 decimals; others reuse the event name
+    const base = aA / 10 ** dBase, quote = aB / 10 ** dQuote; if (!(base > 0 && quote > 0)) return;
     if ((mB === WSOL && quote > 50000) || (USD.has(mB) && quote > 10_000_000)) { this.skipped++; return; } // implausible single trade
     const pxQ = quote / base;
     if (mA === WSOL && USD.has(mB)) { if (pxQ > 1 && pxQ < 100000) this.solUsd = pxQ; }

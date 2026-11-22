@@ -3,7 +3,7 @@
 // compressed batches to MotherDuck every FLUSH_SEC. Stops cleanly after RUN_MIN.
 import { DuckDBInstance } from '@duckdb/node-api';
 import fs from 'fs'; import zlib from 'zlib';
-import { decodeEvent, decodeTx, Registry, Candles } from './decode.mjs';
+import { decodeEvent, decodeTx, decodeUniversalTx, Registry, Candles } from './decode.mjs';
 const KEY = process.env.APERTURE_KEY, MD = process.env.MOTHERDUCK_TOKEN;
 const RUN_MIN = Number(process.env.RUN_MIN || 340), FLUSH_SEC = Number(process.env.FLUSH_SEC || 300);
 const CAP_GB = Number(process.env.CAP_GB || 9);
@@ -40,8 +40,11 @@ function connect() {
     const v = m.params?.result?.value; if (!v || v.err) return;
     const data = v.logs.filter((l) => l.startsWith('Program data: ')).map((l) => l.slice(14));
     if (!data.length) return;
-    if (!seenSig.has(v.signature)) { seenSig.set(v.signature, Date.now());
-      for (const d of data) { const t = decodeEvent(Buffer.from(d, 'base64')); if (t) pendingTrades.push([t, Date.now()]); } }
+    if (!seenSig.has(v.signature)) {
+      let hit = false;
+      for (const d of data) { const t = decodeEvent(Buffer.from(d, 'base64')); if (t) { pendingTrades.push([t, Date.now()]); hit = true; } }
+      if (hit) seenSig.set(v.signature, Date.now());
+    }
     if (RAW) buf.push({ ts: Date.now(), slot: m.params.result.context.slot, sig: v.signature, prog: subName[m.params.subscription] || '?', data: data.join(' ') });
   };
   ws.onclose = () => { if (!stopped) { log('ws closed, reconnect in 2s'); setTimeout(connect, 2000); } };
@@ -119,7 +122,19 @@ async function blockLoop() {
         let blk; try { blk = await call('getBlock', [slot, { encoding: 'json', transactionDetails: 'full', rewards: false, maxSupportedTransactionVersion: 1, commitment: 'confirmed' }]); } catch (e) { log('getBlock', slot, e.message); continue; }
         bs.ms += Date.now() - t1; if (!blk) continue; bs.blocks++;
         const ts = (blk.blockTime || Math.floor(Date.now() / 1000)) * 1000; bs.lag = Date.now() - ts;
-        for (const tx of blk.transactions) for (const t of decodeTx(tx)) { pendingTrades.push([t, ts]); bs.trades[t.kind] = (bs.trades[t.kind] || 0) + 1; }
+        for (const tx of blk.transactions) {
+          const dtx = decodeTx(tx);
+          for (const t of dtx) { pendingTrades.push([t, ts]); bs.trades[t.kind] = (bs.trades[t.kind] || 0) + 1; }
+          const sig = tx.transaction?.signatures?.[0];
+          if (!dtx.length && (!sig || !seenSig.has(sig))) {
+            const u = decodeUniversalTx(tx);
+            if (u) {
+              if (sig) seenSig.set(sig, ts);
+              pendingTrades.push([u, ts]);
+              bs.trades[u.kind] = (bs.trades[u.kind] || 0) + 1;
+            }
+          }
+        }
       }
     }));
     last = tip; await sleep(400);
