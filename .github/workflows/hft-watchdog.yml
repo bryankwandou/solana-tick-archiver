@@ -52,5 +52,23 @@ jobs:
               });
               console.log("Dispatched recovery hft-stream run, HTTP:", d.status);
             }
+            // Zero-gap cloud guard for batch-2h (independent of laptop power state!)
+            const bBase = "https://api.github.com/repos/" + process.env.REPO + "/actions/workflows/batch-2h.yml";
+            const [bAct, bDone] = await Promise.all([
+              fetch(bBase + "/runs?status=in_progress&per_page=3", { headers }).then((r) => r.json()),
+              fetch(bBase + "/runs?status=completed&per_page=3", { headers }).then((r) => r.json()),
+            ]);
+            const bRunning = bAct.workflow_runs?.length || 0;
+            const lastOk = (bDone.workflow_runs || []).find((x) => x.conclusion === "success");
+            const ageMin = lastOk ? (Date.now() - Date.parse(lastOk.created_at)) / 60000 : 999;
+            console.log("batch-2h running:", bRunning, "lastOkAgeMin:", Math.round(ageMin));
+            if (bRunning === 0 && ageMin > 135) {
+              const bd = await fetch(bBase + "/dispatches", {
+                method: "POST",
+                headers: { ...headers, "content-type": "application/json" },
+                body: JSON.stringify({ ref: "main", inputs: { bench_minutes: "0", workers: "4", conc_per_worker: "12" } }),
+              });
+              console.log("Dispatched zero-gap batch-2h run, HTTP:", bd.status);
+            }
           })().catch((e) => { console.error(e); process.exit(1); });
           '

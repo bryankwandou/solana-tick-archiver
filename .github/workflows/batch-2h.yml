@@ -40,6 +40,13 @@ jobs:
           key: registry-v1-${{ github.run_id }}
           restore-keys: |
             registry-v1-
+      - name: Checkout solana-tick-data for publish / zero-gap direct archive
+        if: ${{ inputs.bench_minutes == '' || inputs.bench_minutes == '0' }}
+        uses: actions/checkout@v4
+        with:
+          repository: bryankwandou/solana-tick-data
+          ssh-key: ${{ secrets.DATA_DEPLOY_KEY }}
+          path: data
       - name: Run 2-hourly full-block batch sync / benchmark
         env:
           NODE_OPTIONS: "--max-old-space-size=8192"
@@ -49,14 +56,8 @@ jobs:
           WORKERS: ${{ inputs.workers || '4' }}
           CONC_PER_WORKER: ${{ inputs.conc_per_worker || '12' }}
           MAX_GAP_HOURS: "12"
+          OUT: data/hourly
         run: node batch-sync.mjs
-      - name: Checkout solana-tick-data for publish (production mode only)
-        if: ${{ inputs.bench_minutes == '' || inputs.bench_minutes == '0' }}
-        uses: actions/checkout@v4
-        with:
-          repository: bryankwandou/solana-tick-data
-          ssh-key: ${{ secrets.DATA_DEPLOY_KEY }}
-          path: data
       - name: Export complete hours (ticks + candles1m) and push
         if: ${{ inputs.bench_minutes == '' || inputs.bench_minutes == '0' }}
         env:
@@ -66,7 +67,7 @@ jobs:
           MOTHERDUCK_TOKEN: ${{ secrets.MOTHERDUCK_TOKEN }}
         run: |
           mkdir -p data/hourly
-          node export-db.mjs
+          node export-db.mjs || echo "export-db skipped (MotherDuck unavailable; direct Brotli archive active)"
           cp decode.mjs data/decode.mjs
           cd data
           git config user.name "tick-archiver"

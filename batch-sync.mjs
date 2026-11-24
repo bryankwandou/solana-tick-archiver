@@ -10,16 +10,17 @@ import zlib from 'zlib';
 import { Registry, Candles, WSOL, encodeTicksV2, encodeCandlesV2, MintDict } from './decode.mjs';
 
 const KEY = process.env.APERTURE_KEY;
-const MD = process.env.MOTHERDUCK_TOKEN;
+const MD = process.env.MOTHERDUCK_TOKEN || '';
+const OUT = process.env.OUT || '';
 const RPC = `https://solana-rpc.rpcfast.com/?api_key=${KEY}`;
 const WORKERS = Math.max(1, Number(process.env.WORKERS || 4));
-const CONC_PER_WORKER = Math.max(1, Number(process.env.CONC_PER_WORKER || 20));
+const CONC_PER_WORKER = Math.max(1, Number(process.env.CONC_PER_WORKER || 12));
 const BENCH_MINUTES = Number(process.env.BENCH_MINUTES || 0);
 const BENCH_LAG_MIN = Number(process.env.BENCH_LAG_MIN || 15);
 const MAX_GAP_HOURS = Number(process.env.MAX_GAP_HOURS || 12);
 
-if (!KEY || !MD) {
-  console.error('Missing APERTURE_KEY or MOTHERDUCK_TOKEN');
+if (!KEY) {
+  console.error('Missing APERTURE_KEY');
   process.exit(1);
 }
 
@@ -68,22 +69,50 @@ async function slotAt(first, tip, targetSec) {
   return lo;
 }
 
-const db = await (await DuckDBInstance.create(`md:?motherduck_token=${MD}`)).connect();
-await db.run(`CREATE DATABASE IF NOT EXISTS solana_ticks`);
-await db.run(`CREATE TABLE IF NOT EXISTS solana_ticks.main.ticks (mint VARCHAR, ts BIGINT, p FLOAT)`);
+// Resilient MotherDuck connection: if trial expired / paused / unreachable, seamlessly
+// fall back to DIRECT-ARCHIVE mode writing Brotli ticks + candles1m straight to OUT (data/hourly).
+let db = null;
+if (MD) {
+  try {
+    db = await (await DuckDBInstance.create(`md:?motherduck_token=${MD}`)).connect();
+    await db.run(`CREATE DATABASE IF NOT EXISTS solana_ticks`);
+    await db.run(`CREATE TABLE IF NOT EXISTS solana_ticks.main.ticks (mint VARCHAR, ts BIGINT, p FLOAT)`);
+  } catch (e) {
+    db = null;
+    log('MotherDuck unavailable (using zero-gap direct Brotli archive mode):', String(e.message || e).slice(0, 220));
+    if (!OUT && BENCH_MINUTES === 0) throw e;
+  }
+}
 
-// Seed SOL/USD from MotherDuck so early swaps before first SOL/USDC trade are never skipped
+// Seed SOL/USD from MotherDuck or live Raydium v4 SOL/USDC vaults via RPC Fast
 let seedSolUsd = 0;
-try {
-  const sr = (await db.runAndReadAll(`SELECT p::DOUBLE p FROM solana_ticks.main.ticks WHERE mint='${WSOL}' ORDER BY ts DESC LIMIT 1`)).getRowObjects()[0];
-  if (sr && Number(sr.p) > 1) seedSolUsd = Number(sr.p);
-} catch {}
+if (db) {
+  try {
+    const sr = (await db.runAndReadAll(`SELECT p::DOUBLE p FROM solana_ticks.main.ticks WHERE mint='${WSOL}' ORDER BY ts DESC LIMIT 1`)).getRowObjects()[0];
+    if (sr && Number(sr.p) > 1) seedSolUsd = Number(sr.p);
+  } catch {}
+}
+if (!(seedSolUsd > 1)) {
+  try {
+    const mr = await rpc('getMultipleAccounts', [
+      ['DQyrAcCrDXQ7NeoqGgDCZwBvWDcYmFCjSb9JtteuvPpz', 'HLmqeL62xR1QoZ1HKKbXRrdN1p3phKpxRMb2VVopvBBz'],
+      { encoding: 'base64', commitment: 'confirmed', dataSlice: { offset: 64, length: 8 } },
+    ]);
+    const b0 = mr?.value?.[0]?.data?.[0] ? Buffer.from(mr.value[0].data[0], 'base64') : null;
+    const b1 = mr?.value?.[1]?.data?.[0] ? Buffer.from(mr.value[1].data[0], 'base64') : null;
+    if (b0 && b0.length >= 8 && b1 && b1.length >= 8) {
+      const solAmt = Number(b0.readBigUInt64LE(0)) / 1e9;
+      const usdcAmt = Number(b1.readBigUInt64LE(0)) / 1e6;
+      if (solAmt > 0 && usdcAmt > 0) seedSolUsd = usdcAmt / solAmt;
+    }
+  } catch {}
+}
 
 const first = (await rpc('getFirstAvailableBlock', [])) + 300;
 const tip = await rpc('getSlot', [{ commitment: 'finalized' }]);
 const firstTime = await timeAt(first);
 const tipTime = await timeAt(tip);
-log(`RPC retention: slot ${first} (${new Date(firstTime * 1000).toISOString()}) -> tip ${tip} (${new Date(tipTime * 1000).toISOString()}) | seed SOL/USD=${seedSolUsd.toFixed(2)}`);
+log(`RPC retention: slot ${first} (${new Date(firstTime * 1000).toISOString()}) -> tip ${tip} (${new Date(tipTime * 1000).toISOString()}) | seed SOL/USD=${seedSolUsd.toFixed(2)} | md=${db ? 'online' : 'direct-fallback'}`);
 
 let targetRanges = []; // [[startSlot, endSlot], ...]
 let windowStartMs = 0;
@@ -99,8 +128,8 @@ if (BENCH_MINUTES > 0) {
   const s1 = await slotAt(first, tip, endSec);
   targetRanges.push([s0, s1]);
   log(`BENCH_MODE (${BENCH_MINUTES} min): ${new Date(windowStartMs).toISOString()} -> ${new Date(windowEndMs).toISOString()} | slots ${s0}..${s1} (${s1 - s0 + 1} slots)`);
-} else {
-  // Production mode: find all missing or thin (<30% median) minutes in the last MAX_GAP_HOURS (capped by RPC retention)
+} else if (db) {
+  // Production mode (MotherDuck online): find all missing or thin (<30% median) minutes in the last MAX_GAP_HOURS
   const lookbackSec = Math.max(firstTime + 60, Math.floor(Date.now() / 1000) - MAX_GAP_HOURS * 3600);
   const rows = (await db.runAndReadAll(`SELECT (ts // 60000)::BIGINT m, count(*)::BIGINT n FROM solana_ticks.main.ticks WHERE ts >= ${lookbackSec * 1000} GROUP BY 1`)).getRowObjects();
   const map = new Map(rows.map((r) => [Number(r.m), Number(r.n)]));
@@ -123,6 +152,32 @@ if (BENCH_MINUTES > 0) {
     const s1 = Math.min(tip, (await slotAt(first, tip, (b + 1) * 60)) + 2);
     targetRanges.push([s0, s1]);
     log(`  gap ${new Date(a * 60000).toISOString().slice(0, 16)} (+${b - a + 1} min) -> slots ${s0}..${s1} (${s1 - s0 + 1} slots)`);
+  }
+} else {
+  // Direct Brotli archive mode (MotherDuck paused/offline): detect missing complete UTC hours directly in OUT
+  fs.mkdirSync(OUT, { recursive: true });
+  const endHourSec = Math.floor((tipTime - 60) / 3600) * 3600;
+  const startHourSec = Math.ceil(Math.max(firstTime + 60, endHourSec - MAX_GAP_HOURS * 3600) / 3600) * 3600;
+  const missingHours = [];
+  for (let hs = startHourSec; hs < endHourSec; hs += 3600) {
+    const hName = new Date(hs * 1000).toISOString().slice(0, 13).replace(/[-T]/g, '');
+    const tf = path.join(OUT, `ticks-${hName}.v2.br`);
+    if (!fs.existsSync(tf) || fs.statSync(tf).size === 0) missingHours.push(hs);
+  }
+  // Merge consecutive missing hours (cap to 4h per run so job finishes well within timeout at <=32 RPS)
+  const batchHours = missingHours.slice(0, 4);
+  log(`DIRECT_ARCHIVE_MODE: window ${new Date(startHourSec * 1000).toISOString()} -> ${new Date(endHourSec * 1000).toISOString()}, missing=${missingHours.length}h, processing=${batchHours.length}h`);
+  let cur = null;
+  const hourGroups = [];
+  for (const hs of batchHours) {
+    if (cur && cur[1] === hs - 3600) cur[1] = hs;
+    else hourGroups.push((cur = [hs, hs]));
+  }
+  for (const [hStart, hLast] of hourGroups) {
+    const s0 = Math.max(first, (await slotAt(first, tip, hStart)) - 2);
+    const s1 = Math.min(tip, (await slotAt(first, tip, hLast + 3600)) + 2);
+    targetRanges.push([s0, s1]);
+    log(`  direct hour gap ${new Date(hStart * 1000).toISOString().slice(0, 13)}Z..${new Date((hLast + 3600) * 1000).toISOString().slice(0, 13)}Z -> slots ${s0}..${s1}`);
   }
 }
 
@@ -271,32 +326,77 @@ if (!allSlots.length) {
     console.log(JSON.stringify(summary, null, 2));
     fs.rmSync(benchDir, { recursive: true, force: true });
   } else if (ticks.length) {
-    // Production: single atomic MotherDuck commit (keeps historical_bytes minimal!)
-    const f = `batch2h-${Date.now()}.csv.gz`;
-    fs.writeFileSync(f, zlib.gzipSync(ticks.map((r) => `${r.mint},${r.ts},${r.p}`).join('\n')));
-    const tMd0 = Date.now();
-    await db.run(`INSERT INTO solana_ticks.main.ticks SELECT * FROM read_csv('${f}', header=false, columns={'mint':'VARCHAR','ts':'BIGINT','p':'FLOAT'})`);
-    fs.unlinkSync(f);
-    log(`Inserted ${ticks.length} ticks (${uniqueTokens} tokens) into MotherDuck in ${((Date.now() - tMd0) / 1000).toFixed(1)}s`);
+    if (db) {
+      // Production (MotherDuck online): single atomic commit (keeps historical_bytes at 0!)
+      const f = `batch2h-${Date.now()}.csv.gz`;
+      fs.writeFileSync(f, zlib.gzipSync(ticks.map((r) => `${r.mint},${r.ts},${r.p}`).join('\n')));
+      const tMd0 = Date.now();
+      await db.run(`INSERT INTO solana_ticks.main.ticks SELECT * FROM read_csv('${f}', header=false, columns={'mint':'VARCHAR','ts':'BIGINT','p':'FLOAT'})`);
+      fs.unlinkSync(f);
+      log(`Inserted ${ticks.length} ticks (${uniqueTokens} tokens) into MotherDuck in ${((Date.now() - tMd0) / 1000).toFixed(1)}s`);
+    }
+    if (OUT && !db) {
+      // Direct Brotli export per complete UTC hour into OUT (data/hourly) so zero hours are ever lost
+      fs.mkdirSync(OUT, { recursive: true });
+      const dict = new MintDict(path.join(OUT, 'mints.txt'));
+      const cdict = new MintDict(path.join(OUT, 'mints-1m.txt'));
+      const byHour = new Map();
+      const maxCompleteHour = Math.floor((tipTime - 60) / 3600) * 3600000;
+      for (const r of ticks) {
+        const hMs = Math.floor(r.ts / 3600000) * 3600000;
+        if (hMs >= maxCompleteHour) continue;
+        let arr = byHour.get(hMs);
+        if (!arr) { arr = []; byHour.set(hMs, arr); }
+        arr.push(r);
+      }
+      const sum = [];
+      for (const [hMs, hRows] of [...byHour.entries()].sort((a, b) => a[0] - b[0])) {
+        const hName = new Date(hMs).toISOString().slice(0, 13).replace(/[-T]/g, '');
+        const tf = path.join(OUT, `ticks-${hName}.v2.br`);
+        if (fs.existsSync(tf) && fs.statSync(tf).size > 0) continue;
+        const z = encodeTicksV2(hRows.map((x) => ({ ...x })), dict);
+        fs.writeFileSync(tf, z);
+        const cm = new Map();
+        for (const t of hRows) {
+          const m = Math.floor(t.ts / 60000);
+          const k = t.mint + ' ' + m;
+          const c = cm.get(k);
+          if (!c) cm.set(k, { mint: t.mint, minute: m, o: t.p, h: t.p, l: t.p, c: t.p, v: 0, n: 1 });
+          else { if (t.p > c.h) c.h = t.p; if (t.p < c.l) c.l = t.p; c.c = t.p; c.n++; }
+        }
+        const crow = [...cm.values()];
+        const zc = encodeCandlesV2(crow, cdict);
+        fs.writeFileSync(path.join(OUT, `candles1m-${hName}.v2.br`), zc);
+        sum.push([hName, hRows.length, z.length, zc.length]);
+        log(`Direct archived ${hName}: ticks=${hRows.length} (${(z.length / 1e6).toFixed(2)} MB), candles1m=${crow.length} (${(zc.length / 1e6).toFixed(2)} MB)`);
+      }
+      if (sum.length) {
+        const sp = path.join(OUT, 'summary.csv');
+        const old = fs.existsSync(sp) ? fs.readFileSync(sp, 'utf8').trim().split('\n').slice(1).filter((l) => l && !sum.some((x) => l.startsWith(x[0] + ','))) : [];
+        fs.writeFileSync(sp, 'hour_utc,ticks,tick_bytes,candle1m_bytes\n' + [...old, ...sum.map((x) => x.join(','))].sort().join('\n') + '\n');
+      }
+    }
   }
 }
 
-// Always ensure zero-storage live candle views exist in MotherDuck
-await db.run(`
-  CREATE OR REPLACE VIEW solana_ticks.main.candles_1m AS
-  SELECT mint, (ts // 60000) * 60000 AS t_ms, arg_min(p, ts) AS o, max(p) AS h, min(p) AS l, arg_max(p, ts) AS c, count(*)::BIGINT AS trades
-  FROM solana_ticks.main.ticks WHERE p > 0 GROUP BY mint, (ts // 60000)
-`);
-await db.run(`
-  CREATE OR REPLACE VIEW solana_ticks.main.candles_5m AS
-  SELECT mint, (ts // 300000) * 300000 AS t_ms, arg_min(p, ts) AS o, max(p) AS h, min(p) AS l, arg_max(p, ts) AS c, count(*)::BIGINT AS trades
-  FROM solana_ticks.main.ticks WHERE p > 0 GROUP BY mint, (ts // 300000)
-`);
-await db.run(`
-  CREATE OR REPLACE VIEW solana_ticks.main.candles_1h AS
-  SELECT mint, (ts // 3600000) * 3600000 AS t_ms, arg_min(p, ts) AS o, max(p) AS h, min(p) AS l, arg_max(p, ts) AS c, count(*)::BIGINT AS trades
-  FROM solana_ticks.main.ticks WHERE p > 0 GROUP BY mint, (ts // 3600000)
-`);
+// Always ensure zero-storage live candle views exist when MotherDuck is online
+if (db) {
+  await db.run(`
+    CREATE OR REPLACE VIEW solana_ticks.main.candles_1m AS
+    SELECT mint, (ts // 60000) * 60000 AS t_ms, arg_min(p, ts) AS o, max(p) AS h, min(p) AS l, arg_max(p, ts) AS c, count(*)::BIGINT AS trades
+    FROM solana_ticks.main.ticks WHERE p > 0 GROUP BY mint, (ts // 60000)
+  `);
+  await db.run(`
+    CREATE OR REPLACE VIEW solana_ticks.main.candles_5m AS
+    SELECT mint, (ts // 300000) * 300000 AS t_ms, arg_min(p, ts) AS o, max(p) AS h, min(p) AS l, arg_max(p, ts) AS c, count(*)::BIGINT AS trades
+    FROM solana_ticks.main.ticks WHERE p > 0 GROUP BY mint, (ts // 300000)
+  `);
+  await db.run(`
+    CREATE OR REPLACE VIEW solana_ticks.main.candles_1h AS
+    SELECT mint, (ts // 3600000) * 3600000 AS t_ms, arg_min(p, ts) AS o, max(p) AS h, min(p) AS l, arg_max(p, ts) AS c, count(*)::BIGINT AS trades
+    FROM solana_ticks.main.ticks WHERE p > 0 GROUP BY mint, (ts // 3600000)
+  `);
+}
 log(`Done in ${((Date.now() - tStart) / 1000).toFixed(1)}s total`);
 process.exit(0);
 
