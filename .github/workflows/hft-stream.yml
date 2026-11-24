@@ -10,9 +10,13 @@ on:
         required: false
         default: "A"
       target_rps:
-        description: "Target sustained requests/sec (keep <500 Aperture ceiling)"
+        description: "Target sustained requests/sec (hard-capped <=452, leaves 48+ RPS buffer below 500)"
         required: false
-        default: "445"
+        default: "444"
+      start_rps:
+        description: "Initial RPS on boot (222 during zero-spike handoff, 444 for cold start)"
+        required: false
+        default: "444"
       run_min:
         description: "Minutes per relay segment before zero-gap handoff (max 345)"
         required: false
@@ -39,16 +43,19 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: "22"
-      - name: Stream live Solana DEX vaults (>=400 RPS nonstop until Dec 16)
+      - name: Stream live Solana DEX vaults (>=400 RPS hard-capped <=452 nonstop until Dec 16)
         env:
           APERTURE_KEY: ${{ secrets.APERTURE_KEY }}
           GH_TOKEN: ${{ github.token }}
           GITHUB_REPOSITORY: ${{ github.repository }}
           LANE: ${{ inputs.lane || 'A' }}
-          TARGET_RPS: ${{ inputs.target_rps || '445' }}
-          MIN_FLOOR_RPS: "415"
-          MAX_CEIL_RPS: "465"
+          HARD_CAP_RPS: "452"
+          TARGET_RPS: ${{ inputs.target_rps || '444' }}
+          START_RPS: ${{ inputs.start_rps || inputs.target_rps || '444' }}
+          MIN_FLOOR_RPS: "412"
+          MAX_CEIL_RPS: "452"
           RUN_MIN: ${{ inputs.run_min || '330' }}
           WORKERS: ${{ inputs.workers || '4' }}
           STOP_AT_ISO: "2026-12-16T09:50:00Z"
         run: node hft-stream.mjs
+

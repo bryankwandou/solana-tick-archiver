@@ -2,9 +2,22 @@
 import { parentPort, workerData } from 'worker_threads';
 import { decodeEvent, decodeTx, decodeUniversalTx } from './decode.mjs';
 
-const { workerId, slots, rpcUrl, conc } = workerData;
+const { workerId, slots, rpcUrl, conc, maxRps } = workerData;
+const MAX_RPS = Math.max(1, Number(maxRps || 8)); // 4 workers x 8 = 32 RPS hard cap (keeps total <=499 RPS with hft-stream)
+let secWin = Math.floor(performance.now() / 1000);
+let secCount = 0;
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+async function waitRateSlot() {
+  while (true) {
+    const now = performance.now();
+    const s = Math.floor(now / 1000);
+    if (s !== secWin) { secWin = s; secCount = 0; }
+    if (secCount < MAX_RPS) { secCount++; return; }
+    await sleep(Math.max(10, (s + 1) * 1000 - now));
+  }
+}
 
 async function fetchBlock(slot) {
   for (let attempt = 0; ; attempt++) {
@@ -58,6 +71,7 @@ function flushToParent() {
 async function runSlotLoop() {
   while (idx < slots.length) {
     const slot = slots[idx++];
+    await waitRateSlot();
     rpcCalls++;
     const r = await fetchBlock(slot);
     if (r.skipped) {

@@ -13,9 +13,11 @@ const REPO = process.env.GITHUB_REPOSITORY || 'bryankwandou/solana-tick-archiver
 const LANE = (process.env.LANE || 'A').toUpperCase() === 'B' ? 'B' : 'A';
 const NEXT_LANE = LANE === 'A' ? 'B' : 'A';
 const WORKERS = Math.max(1, Math.min(8, Number(process.env.WORKERS || 4)));
-const BASE_TARGET_RPS = Math.max(50, Math.min(480, Number(process.env.TARGET_RPS || 445)));
-const MIN_FLOOR_RPS = Math.max(50, Math.min(BASE_TARGET_RPS, Number(process.env.MIN_FLOOR_RPS || 415)));
-const MAX_CEIL_RPS = Math.max(BASE_TARGET_RPS, Math.min(485, Number(process.env.MAX_CEIL_RPS || 465)));
+const HARD_CAP_RPS = Math.max(50, Math.min(460, Number(process.env.HARD_CAP_RPS || 452)));
+const BASE_TARGET_RPS = Math.max(50, Math.min(HARD_CAP_RPS, Number(process.env.TARGET_RPS || 444)));
+const START_RPS = Math.max(50, Math.min(BASE_TARGET_RPS, Number(process.env.START_RPS || BASE_TARGET_RPS)));
+const MIN_FLOOR_RPS = Math.max(50, Math.min(BASE_TARGET_RPS, Number(process.env.MIN_FLOOR_RPS || 412)));
+const MAX_CEIL_RPS = Math.max(BASE_TARGET_RPS, Math.min(HARD_CAP_RPS, Number(process.env.MAX_CEIL_RPS || 452)));
 const RUN_MIN = Math.max(1, Math.min(345, Number(process.env.RUN_MIN || 330)));
 const HANDOFF_LEAD_SEC = Math.max(30, Number(process.env.HANDOFF_LEAD_SEC || 180));
 const ENABLE_CHAIN = process.env.ENABLE_CHAIN !== '0';
@@ -217,17 +219,18 @@ async function ghApi(method, apiPath, body) {
   return { status: res.status, data: await res.json().catch(() => null) };
 }
 
-async function dispatchNextLane() {
+async function dispatchNextLane(startRps) {
   const r = await ghApi('POST', `/repos/${REPO}/actions/workflows/hft-stream.yml/dispatches`, {
     ref: 'main',
     inputs: {
       lane: NEXT_LANE,
       target_rps: String(BASE_TARGET_RPS),
+      start_rps: String(startRps),
       run_min: String(RUN_MIN),
       workers: String(WORKERS),
     },
   });
-  log(`Handoff dispatch -> lane=${NEXT_LANE} status=${r?.status ?? 'no-token'}`);
+  log(`Handoff dispatch -> lane=${NEXT_LANE} start_rps=${startRps} status=${r?.status ?? 'no-token'}`);
   return r?.status === 204;
 }
 
@@ -244,7 +247,8 @@ for (const t of initialTargets) dexCounts[t.dex] = (dexCounts[t.dex] || 0) + 1;
 log(`Starting nonstop HFT DEX stream: target=${BASE_TARGET_RPS} RPS, workers=${WORKERS}, runMin=${RUN_MIN}, cutoff=${STOP_AT_ISO}`);
 log(`Verified ${initialTargets.length} live vault accounts across ${uniquePools} pools: ${JSON.stringify(dexCounts)}`);
 
-let currentTotalRps = BASE_TARGET_RPS;
+let currentTotalRps = START_RPS;
+let softStartActive = START_RPS < BASE_TARGET_RPS;
 let calmWindows = 0;
 let totalOk = 0;
 let total429 = 0;
@@ -344,22 +348,31 @@ setInterval(async () => {
     `slot=${latestSlot} bw=${kbSec}KB/s t=${elapsedMin}m`,
   );
 
-  // Adaptive rate control: stay >=415 RPS while avoiding 429 overload below 500 RPS ceiling
-  if (win.r429 > 5) {
+  // Soft-start ramp: if launched as overlapping handoff lane at 222 RPS, wait until old lane exits
+  // before ramping up to BASE_TARGET_RPS so combined traffic NEVER crosses 499 RPS.
+  if (softStartActive && !handoffDispatched) {
+    const active = await countActiveHftRuns().catch(() => 1);
+    if (active <= 1) {
+      softStartActive = false;
+      log(`Solo lane confirmed (active=${active}); ramping ${currentTotalRps} -> ${BASE_TARGET_RPS} RPS`);
+      broadcastRps(BASE_TARGET_RPS);
+    }
+  } else if (win.r429 > 3) {
+    // Adaptive rate control: stay >=412 RPS while hard-capped <=452 RPS (48+ RPS buffer below 500 ceiling)
     calmWindows = 0;
-    const stepped = Math.max(MIN_FLOOR_RPS, currentTotalRps - 15);
+    const stepped = Math.max(MIN_FLOOR_RPS, currentTotalRps - 12);
     if (stepped !== currentTotalRps) {
       log(`Adaptive backoff: ${currentTotalRps} -> ${stepped} RPS (r429=${win.r429})`);
       broadcastRps(stepped);
     }
-  } else if (win.r429 === 0) {
+  } else if (win.r429 === 0 && !handoffDispatched) {
     calmWindows++;
     if (calmWindows >= 2 && currentTotalRps < BASE_TARGET_RPS) {
-      const raised = Math.min(BASE_TARGET_RPS, currentTotalRps + 10);
+      const raised = Math.min(BASE_TARGET_RPS, currentTotalRps + 8);
       log(`Adaptive recovery: ${currentTotalRps} -> ${raised} RPS`);
       broadcastRps(raised);
-    } else if (calmWindows >= 3 && rps < 410 && currentTotalRps < MAX_CEIL_RPS) {
-      const nudged = Math.min(MAX_CEIL_RPS, currentTotalRps + 10);
+    } else if (calmWindows >= 3 && rps < 408 && currentTotalRps < MAX_CEIL_RPS) {
+      const nudged = Math.min(MAX_CEIL_RPS, currentTotalRps + 8);
       log(`Floor boost: observed ${rps.toFixed(1)} RPS -> target ${nudged} RPS`);
       broadcastRps(nudged);
     }
@@ -383,23 +396,26 @@ setInterval(async () => {
   const runElapsedSec = (now - tStart) / 1000;
   const maxRunSec = RUN_MIN * 60;
 
-  // Dispatch opposite lane early so next runner boots and reaches 445 RPS with zero gap
+  // Coordinated zero-spike handoff: drop current lane to half (222 RPS) BEFORE dispatching next lane at 222 RPS
+  // so 222 + 222 = 444 <= 499 RPS (zero 500+ spikes, zero seconds below 400 RPS).
   if (ENABLE_CHAIN && !handoffDispatched && runElapsedSec >= maxRunSec - HANDOFF_LEAD_SEC) {
     if (!Number.isFinite(STOP_AT_MS) || now + 300_000 < STOP_AT_MS) {
       handoffDispatched = true;
-      await dispatchNextLane().catch((e) => log('dispatch error:', e.message));
+      const halfRps = Math.floor(BASE_TARGET_RPS / 2);
+      log(`Preparing zero-spike handoff: halving lane=${LANE} to ${halfRps} RPS before starting lane=${NEXT_LANE}`);
+      broadcastRps(halfRps);
+      await dispatchNextLane(halfRps).catch((e) => log('dispatch error:', e.message));
     }
   }
 
-  // Once opposite lane is confirmed in_progress, cross-fade RPS smoothly and exit with zero gap
+  // Once opposite lane is confirmed in_progress for 15s (both running 222 + 222 = 444 RPS), exit cleanly
   if (handoffDispatched) {
     const active = await countActiveHftRuns().catch(() => 1);
     if (active >= 2) {
       if (!nextActiveSince) {
         nextActiveSince = now;
-        log(`Next lane=${NEXT_LANE} is active; cross-fading this lane to 200 RPS before exit`);
-        broadcastRps(200);
-      } else if (now - nextActiveSince >= 10000) {
+        log(`Next lane=${NEXT_LANE} active alongside lane=${LANE} (combined <=${BASE_TARGET_RPS} RPS); exiting in 12s`);
+      } else if (now - nextActiveSince >= 12000) {
         await gracefulShutdown(`handoff complete to lane=${NEXT_LANE}`);
         return;
       }

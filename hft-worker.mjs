@@ -137,20 +137,33 @@ function fireOne() {
   req.end();
 }
 
-// High-resolution token-bucket pacer (10ms tick) to keep RPS locked independent of RTT jitter
+// Strict per-second hard-capped token-bucket pacer (zero micro-burst above ceiling)
 let tokens = 0;
 let lastTick = performance.now();
+let secWindowStart = Math.floor(lastTick / 1000);
+let secDispatched = 0;
 const pacer = setInterval(() => {
   if (stopped) return;
   const now = performance.now();
-  const dt = Math.min(100, now - lastTick);
+  const curSec = Math.floor(now / 1000);
+  if (curSec !== secWindowStart) {
+    secWindowStart = curSec;
+    secDispatched = 0;
+  }
+  const hardSecCap = Math.floor(targetRps);
+  if (hardSecCap <= 0 || secDispatched >= hardSecCap) {
+    lastTick = now;
+    return;
+  }
+  const dt = Math.min(40, now - lastTick);
   lastTick = now;
-  tokens = Math.min(targetRps * 0.25, tokens + (targetRps * dt) / 1000);
-  while (tokens >= 1 && inFlight < maxInFlight) {
+  tokens = Math.min(1.5, tokens + (targetRps * dt) / 1000);
+  while (tokens >= 1 && inFlight < maxInFlight && secDispatched < hardSecCap) {
     tokens -= 1;
+    secDispatched++;
     fireOne();
   }
-}, 10);
+}, 5);
 
 // Flush telemetry snapshot to coordinator every 1s for smooth 10s RPS aggregation
 const reporter = setInterval(() => {
