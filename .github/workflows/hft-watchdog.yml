@@ -1,0 +1,56 @@
+name: hft-watchdog
+# Lightweight watchdog every 30 minutes: ensures hft-stream stays active nonstop until 16 Dec 17:50 UTC+8.
+# Auto-disables itself after 2026-12-16T09:50:00Z so RPC Fast Free Plan is never over-consumed.
+on:
+  schedule:
+    - cron: "*/30 * * * *"
+  workflow_dispatch: {}
+
+concurrency:
+  group: hft-watchdog
+  cancel-in-progress: true
+
+permissions:
+  actions: write
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Verify hft-stream liveness before cutoff
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          STOP_AT_ISO: "2026-12-16T09:50:00Z"
+        run: |
+          node -e '
+          (async () => {
+            const cutoff = Date.parse(process.env.STOP_AT_ISO);
+            if (Date.now() >= cutoff) {
+              console.log("Cutoff reached:", process.env.STOP_AT_ISO, "- watchdog exiting cleanly.");
+              return;
+            }
+            const headers = {
+              authorization: "Bearer " + process.env.GH_TOKEN,
+              accept: "application/vnd.github+json",
+              "user-agent": "hft-watchdog"
+            };
+            const base = "https://api.github.com/repos/" + process.env.REPO + "/actions/workflows/hft-stream.yml";
+            const [r1, r2] = await Promise.all([
+              fetch(base + "/runs?status=in_progress&per_page=5", { headers }).then((r) => r.json()),
+              fetch(base + "/runs?status=queued&per_page=5", { headers }).then((r) => r.json()),
+            ]);
+            const active = (r1.workflow_runs?.length || 0) + (r2.workflow_runs?.length || 0);
+            console.log("Active/queued hft-stream runs:", active);
+            if (active === 0) {
+              const d = await fetch(base + "/dispatches", {
+                method: "POST",
+                headers: { ...headers, "content-type": "application/json" },
+                body: JSON.stringify({ ref: "main", inputs: { lane: "A", target_rps: "445", run_min: "330", workers: "4" } }),
+              });
+              console.log("Dispatched recovery hft-stream run, HTTP:", d.status);
+            }
+          })().catch((e) => { console.error(e); process.exit(1); });
+          '

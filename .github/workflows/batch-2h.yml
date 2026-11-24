@@ -17,7 +17,7 @@ on:
       conc_per_worker:
         description: "Concurrent getBlock requests per worker"
         required: false
-        default: "30"
+        default: "12"
 
 concurrency:
   group: batch-2h
@@ -47,7 +47,7 @@ jobs:
           MOTHERDUCK_TOKEN: ${{ secrets.MOTHERDUCK_TOKEN }}
           BENCH_MINUTES: ${{ inputs.bench_minutes || '0' }}
           WORKERS: ${{ inputs.workers || '4' }}
-          CONC_PER_WORKER: ${{ inputs.conc_per_worker || '30' }}
+          CONC_PER_WORKER: ${{ inputs.conc_per_worker || '12' }}
           MAX_GAP_HOURS: "12"
         run: node batch-sync.mjs
       - name: Checkout solana-tick-data for publish (production mode only)

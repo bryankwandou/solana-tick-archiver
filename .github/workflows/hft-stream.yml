@@ -1,0 +1,54 @@
+name: hft-stream
+# Nonstop >=400 RPS real Solana DEX vault streamer on GitHub Actions (public repo = unlimited minutes).
+# Zero MotherDuck CU/storage usage (batch-2h.yml handles MotherDuck archiving).
+# Auto-stops cleanly at 2026-12-16T09:50:00Z (16 Dec 17:50 UTC+8) before RPC Fast Free Plan downgrade.
+on:
+  workflow_dispatch:
+    inputs:
+      lane:
+        description: "Overlapping relay lane (A or B)"
+        required: false
+        default: "A"
+      target_rps:
+        description: "Target sustained requests/sec (keep <500 Aperture ceiling)"
+        required: false
+        default: "445"
+      run_min:
+        description: "Minutes per relay segment before zero-gap handoff (max 345)"
+        required: false
+        default: "330"
+      workers:
+        description: "Parallel worker threads"
+        required: false
+        default: "4"
+
+concurrency:
+  group: hft-stream-${{ inputs.lane || 'A' }}
+  cancel-in-progress: false
+
+permissions:
+  actions: write
+  contents: read
+
+jobs:
+  stream:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Stream live Solana DEX vaults (>=400 RPS nonstop until Dec 16)
+        env:
+          APERTURE_KEY: ${{ secrets.APERTURE_KEY }}
+          GH_TOKEN: ${{ github.token }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          LANE: ${{ inputs.lane || 'A' }}
+          TARGET_RPS: ${{ inputs.target_rps || '445' }}
+          MIN_FLOOR_RPS: "415"
+          MAX_CEIL_RPS: "465"
+          RUN_MIN: ${{ inputs.run_min || '330' }}
+          WORKERS: ${{ inputs.workers || '4' }}
+          STOP_AT_ISO: "2026-12-16T09:50:00Z"
+        run: node hft-stream.mjs
