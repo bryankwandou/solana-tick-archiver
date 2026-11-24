@@ -1,10 +1,8 @@
 name: archive
-# 24/7: each run streams ~5h40m, then dispatches the next run itself.
-# The 6-hourly cron is only a safety net if a chain link ever breaks.
+# Manual-only live stream fallback (24/7 schedule & self-chain disabled to stay well under
+# MotherDuck Free Lite limits: 10 GB storage + 10 CU-hours/month. batch-2h.yml is the primary engine).
 on:
   workflow_dispatch: {}
-  schedule:
-    - cron: "17 */6 * * *"
 concurrency:
   group: archive
   cancel-in-progress: false
@@ -28,8 +26,3 @@ jobs:
           FLUSH_SEC: "300"
           CAP_GB: "9"
         run: node fetch.mjs
-      - name: Chain next run
-        if: always()
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: gh workflow run archive.yml -R ${{ github.repository }} --ref main

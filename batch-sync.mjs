@@ -16,7 +16,7 @@ const WORKERS = Math.max(1, Number(process.env.WORKERS || 4));
 const CONC_PER_WORKER = Math.max(1, Number(process.env.CONC_PER_WORKER || 20));
 const BENCH_MINUTES = Number(process.env.BENCH_MINUTES || 0);
 const BENCH_LAG_MIN = Number(process.env.BENCH_LAG_MIN || 15);
-const MAX_GAP_HOURS = Number(process.env.MAX_GAP_HOURS || 4);
+const MAX_GAP_HOURS = Number(process.env.MAX_GAP_HOURS || 12);
 
 if (!KEY || !MD) {
   console.error('Missing APERTURE_KEY or MOTHERDUCK_TOKEN');
@@ -299,3 +299,4 @@ await db.run(`
 `);
 log(`Done in ${((Date.now() - tStart) / 1000).toFixed(1)}s total`);
 process.exit(0);
+

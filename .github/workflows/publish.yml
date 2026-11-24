@@ -1,14 +1,9 @@
 name: publish-data
-# Every complete UTC hour (>= 3 h old, after the 2-hourly backfill) is exported from
-# MotherDuck into bryankwandou/solana-tick-data as tick-v2 + 1-minute candle files.
-# Catch-up by design: a dropped cron run is covered by the next one, nothing is rewritten.
+# Manual publish fallback (hourly schedule disabled because batch-2h.yml already exports
+# and pushes ticks + candles1m to bryankwandou/solana-tick-data in the same 2-hourly run,
+# saving 24 redundant MotherDuck CU wakeups/day).
 on:
-  schedule: [{ cron: '23 * * * *' }]
   workflow_dispatch:
-  # GitHub drops cron runs; every finished backfill (2-hourly) and archive link also triggers a publish.
-  workflow_run:
-    workflows: [backfill-ticks, archive]
-    types: [completed]
 concurrency: { group: publish-data, cancel-in-progress: false }
 jobs:
   publish:
@@ -22,7 +17,7 @@ jobs:
           ssh-key: ${{ secrets.DATA_DEPLOY_KEY }}
           path: data
       - uses: actions/setup-node@v4
-        with: { node-version: 22 }
+        with: { node-version: "22" }
       - run: npm install --no-audit --no-fund
       - name: export new hours
         run: |
@@ -30,7 +25,7 @@ jobs:
           node export-db.mjs
         env:
           FROM_TS: '1794855600000'
-          LAG_H: '3'
+          LAG_H: '1'
           OUT: data/hourly
           MOTHERDUCK_TOKEN: ${{ secrets.MOTHERDUCK_TOKEN }}
       - name: commit and push
