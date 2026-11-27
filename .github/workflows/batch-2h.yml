@@ -23,10 +23,14 @@ concurrency:
   group: batch-2h
   cancel-in-progress: false
 
+permissions:
+  actions: write
+  contents: read
+
 jobs:
   sync:
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -55,13 +59,14 @@ jobs:
           BENCH_MINUTES: ${{ inputs.bench_minutes || '0' }}
           WORKERS: ${{ inputs.workers || '4' }}
           CONC_PER_WORKER: ${{ inputs.conc_per_worker || '12' }}
-          MAX_GAP_HOURS: "12"
+          MAX_GAP_HOURS: "19"
+          MAX_SLOTS_PER_RUN: "28000"
           OUT: data/hourly
         run: node batch-sync.mjs
       - name: Export complete hours (ticks + candles1m) and push
         if: ${{ inputs.bench_minutes == '' || inputs.bench_minutes == '0' }}
         env:
-          FROM_TS: "1794855600000"
+          FROM_H: "22"
           LAG_H: "1"
           OUT: data/hourly
           MOTHERDUCK_TOKEN: ${{ secrets.MOTHERDUCK_TOKEN }}
@@ -77,3 +82,14 @@ jobs:
           n=$(git diff --cached --name-only | grep -c '^hourly/ticks-' || true)
           git commit -q -m "batch-2h: add $n hour(s) of ticks + candles1m"
           for i in 1 2 3; do git push -q && break; git pull -q --rebase; done
+      - name: Chain next catch-up chunk if more gaps remain before cutoff
+        if: ${{ inputs.bench_minutes == '' || inputs.bench_minutes == '0' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [ -f .has_more_gaps ]; then
+            node -e 'if (Date.now() < Date.parse("2026-12-16T09:50:00Z")) process.exit(0); process.exit(1);' && \
+            gh workflow run batch-2h.yml -R ${{ github.repository }} --ref main -f bench_minutes=0 -f workers=4 -f conc_per_worker=12 || true
+          else
+            echo "No remaining gaps (.has_more_gaps absent)."
+          fi

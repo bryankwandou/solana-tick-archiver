@@ -17,7 +17,8 @@ const WORKERS = Math.max(1, Number(process.env.WORKERS || 4));
 const CONC_PER_WORKER = Math.max(1, Number(process.env.CONC_PER_WORKER || 12));
 const BENCH_MINUTES = Number(process.env.BENCH_MINUTES || 0);
 const BENCH_LAG_MIN = Number(process.env.BENCH_LAG_MIN || 15);
-const MAX_GAP_HOURS = Number(process.env.MAX_GAP_HOURS || 12);
+const MAX_GAP_HOURS = Number(process.env.MAX_GAP_HOURS || 19);
+const MAX_SLOTS_PER_RUN = Math.max(5000, Number(process.env.MAX_SLOTS_PER_RUN || 28000)); // ~3h per run (~14.5m at 32 RPS, never hits job timeout)
 
 if (!KEY) {
   console.error('Missing APERTURE_KEY');
@@ -146,12 +147,30 @@ if (BENCH_MINUTES > 0) {
     }
   }
   log(`PROD_MODE: lookback ${new Date(lookbackSec * 1000).toISOString()} -> ${new Date(m1 * 60000).toISOString()}, median=${med}/min, gap windows=${gaps.length}`);
+  let queuedSlots = 0;
+  let hasMoreGaps = false;
   for (const [a, b] of gaps) {
-    await db.run(`DELETE FROM solana_ticks.main.ticks WHERE ts >= ${a * 60000} AND ts < ${(b + 1) * 60000}`);
+    if (queuedSlots >= MAX_SLOTS_PER_RUN) {
+      hasMoreGaps = true;
+      break;
+    }
+    const maxMinInChunk = Math.max(1, Math.floor((MAX_SLOTS_PER_RUN - queuedSlots) / 160));
+    const bClamped = Math.min(b, a + maxMinInChunk - 1);
+    if (bClamped < b) hasMoreGaps = true;
+    await db.run(`DELETE FROM solana_ticks.main.ticks WHERE ts >= ${a * 60000} AND ts < ${(bClamped + 1) * 60000}`);
     const s0 = Math.max(first, (await slotAt(first, tip, a * 60)) - 2);
-    const s1 = Math.min(tip, (await slotAt(first, tip, (b + 1) * 60)) + 2);
-    targetRanges.push([s0, s1]);
-    log(`  gap ${new Date(a * 60000).toISOString().slice(0, 16)} (+${b - a + 1} min) -> slots ${s0}..${s1} (${s1 - s0 + 1} slots)`);
+    const s1 = Math.min(tip, (await slotAt(first, tip, (bClamped + 1) * 60)) + 2);
+    if (s1 >= s0) {
+      targetRanges.push([s0, s1]);
+      queuedSlots += (s1 - s0 + 1);
+      log(`  gap ${new Date(a * 60000).toISOString().slice(0, 16)} (+${bClamped - a + 1} min) -> slots ${s0}..${s1} (${s1 - s0 + 1} slots, cumulative=${queuedSlots})`);
+    }
+  }
+  if (hasMoreGaps) {
+    fs.writeFileSync('.has_more_gaps', '1');
+    log(`Chunk cap (${MAX_SLOTS_PER_RUN} slots) reached; wrote .has_more_gaps to auto-chain next catchup run.`);
+  } else if (fs.existsSync('.has_more_gaps')) {
+    fs.unlinkSync('.has_more_gaps');
   }
 } else {
   // Direct Brotli archive mode (MotherDuck paused/offline): detect missing complete UTC hours directly in OUT
