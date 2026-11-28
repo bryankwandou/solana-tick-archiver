@@ -137,15 +137,16 @@ function fireOne() {
   req.end();
 }
 
-// Strict per-second hard-capped token-bucket pacer (zero micro-burst above ceiling)
+// Strict phase-staggered per-second token-bucket pacer (spreads 4 workers cleanly to prevent micro-burst 429s)
+const phaseOffsetMs = workerId * 250;
 let tokens = 0;
 let lastTick = performance.now();
-let secWindowStart = Math.floor(lastTick / 1000);
+let secWindowStart = Math.floor((lastTick + phaseOffsetMs) / 1000);
 let secDispatched = 0;
 const pacer = setInterval(() => {
   if (stopped) return;
   const now = performance.now();
-  const curSec = Math.floor(now / 1000);
+  const curSec = Math.floor((now + phaseOffsetMs) / 1000);
   if (curSec !== secWindowStart) {
     secWindowStart = curSec;
     secDispatched = 0;
@@ -157,7 +158,7 @@ const pacer = setInterval(() => {
   }
   const dt = Math.min(40, now - lastTick);
   lastTick = now;
-  tokens = Math.min(1.5, tokens + (targetRps * dt) / 1000);
+  tokens = Math.min(1.0, tokens + (targetRps * dt) / 1000);
   while (tokens >= 1 && inFlight < maxInFlight && secDispatched < hardSecCap) {
     tokens -= 1;
     secDispatched++;

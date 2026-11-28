@@ -66,7 +66,7 @@ jobs:
       - name: Export complete hours (ticks + candles1m) and push
         if: ${{ inputs.bench_minutes == '' || inputs.bench_minutes == '0' }}
         env:
-          FROM_H: "22"
+          FROM_H: "48"
           LAG_H: "1"
           OUT: data/hourly
           MOTHERDUCK_TOKEN: ${{ secrets.MOTHERDUCK_TOKEN }}

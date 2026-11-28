@@ -48,7 +48,7 @@ jobs:
               const d = await fetch(base + "/dispatches", {
                 method: "POST",
                 headers: { ...headers, "content-type": "application/json" },
-                body: JSON.stringify({ ref: "main", inputs: { lane: "A", target_rps: "444", start_rps: "444", run_min: "330", workers: "4" } }),
+                body: JSON.stringify({ ref: "main", inputs: { lane: "A", target_rps: "420", start_rps: "420", run_min: "330", workers: "4" } }),
               });
               console.log("Dispatched recovery hft-stream run, HTTP:", d.status);
             }

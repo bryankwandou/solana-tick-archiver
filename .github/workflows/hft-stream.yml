@@ -10,13 +10,13 @@ on:
         required: false
         default: "A"
       target_rps:
-        description: "Target sustained requests/sec (hard-capped <=452, leaves 48+ RPS buffer below 500)"
+        description: "Target sustained requests/sec (hard-capped <=432, leaves 68+ RPS buffer below 500)"
         required: false
-        default: "444"
+        default: "420"
       start_rps:
-        description: "Initial RPS on boot (222 during zero-spike handoff, 444 for cold start)"
+        description: "Initial RPS on boot (half during zero-spike handoff, 420 for cold start)"
         required: false
-        default: "444"
+        default: "420"
       run_min:
         description: "Minutes per relay segment before zero-gap handoff (max 345)"
         required: false
@@ -49,11 +49,11 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           GITHUB_REPOSITORY: ${{ github.repository }}
           LANE: ${{ inputs.lane || 'A' }}
-          HARD_CAP_RPS: "452"
-          TARGET_RPS: ${{ inputs.target_rps || '444' }}
-          START_RPS: ${{ inputs.start_rps || inputs.target_rps || '444' }}
-          MIN_FLOOR_RPS: "412"
-          MAX_CEIL_RPS: "452"
+          HARD_CAP_RPS: "432"
+          TARGET_RPS: ${{ inputs.target_rps || '420' }}
+          START_RPS: ${{ inputs.start_rps || inputs.target_rps || '420' }}
+          MIN_FLOOR_RPS: "320"
+          MAX_CEIL_RPS: "432"
           RUN_MIN: ${{ inputs.run_min || '330' }}
           WORKERS: ${{ inputs.workers || '4' }}
           STOP_AT_ISO: "2026-12-16T09:50:00Z"
